@@ -15,3 +15,20 @@ Implements the interactive-story-generator skill with persistent memory.
 - Then reply with A / B / C / D / E / I to continue
 
 See skill docs for full rules.
+
+## Hybrid AI Architecture (v3+)
+
+- **Main Story Generation**: xAI Grok (`grok-3-latest`) — creative, detailed Traditional Chinese narrative
+- **Guardrail (Consistency Check)**: Local LM Studio (`gemma-4-E4B`) — validates character consistency before sending to user
+- **Image Generation (I option)**:
+  - `IMAGE_MODE=groq` → Grok Imagine (placeholder)
+  - `IMAGE_MODE=comfyui` → Local ComfyUI
+
+### Environment Variables
+Copy `.env.example` to `.env` and fill in your keys.
+
+### New Commands
+- `/image_mode groq` or `/image_mode comfyui`
+- `/test_guardrail` — test the local consistency checker
+
+All data (characters, relationships, memories) is stored in `stories.db`.

@@ -5,6 +5,7 @@ Follows the interactive-story-generator skill rules.
 """
 
 import asyncio
+import json
 import os
 import re
 import sqlite3
@@ -17,14 +18,31 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 from openai import OpenAI
+import logging
+
+from local_guardrail import check_story_consistency
 
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://192.168.1.96:1234/v1")
-MODEL_NAME = os.getenv("STORY_MODEL", "gemma-4-E4B")
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+# xAI Grok (main story generation)
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-3-latest")
+grok_client = OpenAI(base_url="https://api.x.ai/v1", api_key=GROK_API_KEY) if GROK_API_KEY else None
+
+# Local LM Studio (Guardrail)
+LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://192.168.1.96:1234/v1")
+LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "gemma-4-E4B")
+local_client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
+
+# Image mode
+IMAGE_MODE = os.getenv("IMAGE_MODE", "groq").lower()  # groq or comfyui
+COMFYUI_URL = os.getenv("COMFYUI_URL", "http://127.0.0.1:8188")
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "stories.db"
@@ -95,49 +113,55 @@ def parse_choices(chapter_text: str) -> dict:
     return choices
 
 
+# ====================== HYBRID GENERATION (Grok + Local Guardrail) ======================
+
+GROK_SYSTEM_PROMPT = """【最高優先級規則 - 角色一致性】
+你係 sleyStory 嘅故事生成器。生成任何內容前必須嚴格遵守以下規則：
+
+1. 所有角色必須 100% 符合 database 所儲存嘅：
+   - 性格、MBTI、目標（短期/中期/長期）、能力、外型、持有物品、current_state
+2. 所有角色之間嘅互動必須符合 character_relationships 表嘅：
+   - relationship_type、trust_level、affection_level、歷史摘要
+3. 如果你生成嘅內容違反以上任何一點，會被本地 Guardrail 拒絕並要求修改。
+
+請用極致細膩嘅繁體中文描寫，並確保角色行動、對話、內心完全一致。
+你必須維持故事的原始風格、角色性格、世界觀與氛圍，直到第20章都不改變。
+每次產生 800-1800 字的詳細章節，包含大量對話、關係發展、真實後果。
+⚠️ 每章結尾「必須」包含 A/B/C/D/E/I 選項，絕對不要省略！
+⚠️ 絕對不要在章節開頭輸出任何 meta 說明，直接從章節標題開始。"""
+
+
 def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str = "", is_first: bool = False) -> tuple:
+    """
+    Hybrid generation:
+    1. Load context (characters, relationships, bible, recent chapters)
+    2. Call Grok for creative generation
+    3. Run local guardrail (up to 2 retries)
+    4. Save everything
+    """
     ctx = load_story_context(story_id)
     chapter_num = ctx["current_chapter"] + (0 if is_first else 1)
 
-    system_prompt = (
-        "你是專業的繁體中文長篇互動故事生成器，嚴格遵守 interactive-story-generator 規則。"
-        "你必須維持故事的原始風格、角色性格、世界觀與氛圍，直到第20章都不改變。"
-        "每次產生 800-1800 字的詳細章節，包含大量對話、關係發展、真實後果。"
-        "⚠️ 每章結尾「必須」包含 A/B/C/D/E/I 選項，否則用戶無法繼續。絕對不要省略選項部分！"
-        "⚠️ 絕對不要在章節開頭輸出任何 meta 說明、思考過程或「本章節的內容為根據...」。直接從章節標題開始。"
-    )
+    # Build rich context for Grok
+    char_context = ""
+    if "characters" in ctx and ctx["characters"]:
+        char_context = "\n【角色資料】\n" + "\n".join(
+            [f"{name}: {json.dumps(data, ensure_ascii=False)}" for name, data in ctx.get("characters", {}).items()]
+        )
+
+    rel_context = ""
+    if "relationships" in ctx and ctx["relationships"]:
+        rel_context = "\n【關係資料】\n" + "\n".join(
+            [f"{r['character_a']} → {r['character_b']}: {r['relationship_type']} "
+             f"(信任{r['trust_level']}, 好感{r['affection_level']})" for r in ctx.get("relationships", [])]
+        )
+
+    history = "\n\n".join([f"第 {ch[0]} 章選擇：{ch[2]}" for ch in ctx["recent_chapters"]])
 
     if is_first:
         user_msg = f"""用戶想要的故事主題與風格：{initial_prompt or '未指定'}
-
-請先生成**第 1 章**（繁體中文，800-1800字），格式如下：
-
-**第 1 章：【章節標題】**
-
-[沉浸式繁體中文敘事...]
-
-**你接下來要怎麼做？**
-A) [選項A — 簡短誘人描述]
-B) [選項B — 會帶來不同走向]
-C) [選項C]
-D) [選項D]
-E) [選項E — 可選]
-I) [生成本篇圖像] （為本章最重要場面生成AI圖像）
-
-⚠️ 每章結尾「必須」包含以上選項格式，絕對不要省略！
-⚠️ 絕對不要在章節開頭輸出任何 meta 說明或思考過程。直接從章節標題開始。
-
-然後在章節結束後，輸出一個 JSON Story Bible（用 ```json 包起來），包含：
-{{
-  "core_style": "故事的核心風格與氛圍描述（例如：輕鬆日常、溫暖幽默、專注小細節）",
-  "main_characters": {{"角色名": "背景與性格"}},
-  "world_rules": "世界觀與重要設定",
-  "tone_rules": "絕對不能出現的元素或必須保持的元素"
-}}
-
-（內部記憶更新 — 不顯示給用戶）"""
+請生成第 1 章（繁體中文），嚴格遵守角色一致性規則。格式必須包含章節標題 + 敘事 + A/B/C/D/E/I 選項 + ```json Story Bible。"""
     else:
-        history = "\n\n".join([f"第 {ch[0]} 章選擇：{ch[2]}" for ch in ctx["recent_chapters"]])
         user_msg = f"""目前 Story Bible：
 {ctx['story_bible']}
 
@@ -146,65 +170,84 @@ I) [生成本篇圖像] （為本章最重要場面生成AI圖像）
 
 之前章節選擇記錄：
 {history}
+{char_context}
+{rel_context}
 
-請嚴格維持 Story Bible 中定義的風格，生成第 {chapter_num} 章（繁體中文），並在章節後更新 Story Bible（JSON）。
+請嚴格遵守角色一致性規則，生成第 {chapter_num} 章（繁體中文），並更新 Story Bible（JSON）。"""
 
-⚠️ 重要：每章結尾「必須」包含以下格式的選項，否則用戶無法繼續：
-
-**你接下來要怎麼做？**
-A) [選項A — 簡短誘人描述]
-B) [選項B — 會帶來不同走向]
-C) [選項C]
-D) [選項D]
-E) [選項E — 可選]
-I) [生成本篇圖像] （為本章最重要場面生成AI圖像）
-
-絕對不要省略選項部分！格式必須完全符合技能文件規定。
-⚠️ 絕對不要在章節開頭輸出任何 meta 說明、思考過程或「本章節的內容為根據...」。直接從章節標題開始。"""
+    if not grok_client:
+        return "錯誤：未設定 GROK_API_KEY，無法使用 Grok 生成故事。", chapter_num
 
     try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
+        # Step 1: Generate with Grok
+        response = grok_client.chat.completions.create(
+            model=GROK_MODEL,
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": GROK_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg}
             ],
-            temperature=0.82,
-            max_tokens=3000
+            temperature=0.85,
+            max_tokens=3500
         )
         full_output = response.choices[0].message.content.strip()
+        logger.info(f"Grok generated chapter {chapter_num} for story {story_id}")
 
-        # Split chapter content and possible bible update
+        # Step 2: Guardrail check (up to 2 retries)
+        for attempt in range(3):
+            guard = check_story_consistency(full_output, story_id)
+            if guard.get("is_valid", True):
+                break
+            logger.warning(f"Guardrail violation on attempt {attempt+1}: {guard.get('violations')}")
+            if attempt == 2:
+                break
+            # Ask Grok to fix
+            fix_msg = f"""以下內容被本地 Guardrail 發現違反角色一致性：
+違規項目：{guard.get('violations')}
+修改建議：{guard.get('suggestions')}
+
+請根據建議重新生成修正版章節，保持原有風格與長度。"""
+            response = grok_client.chat.completions.create(
+                model=GROK_MODEL,
+                messages=[
+                    {"role": "system", "content": GROK_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                    {"role": "assistant", "content": full_output},
+                    {"role": "user", "content": fix_msg}
+                ],
+                temperature=0.7,
+                max_tokens=3500
+            )
+            full_output = response.choices[0].message.content.strip()
+
+        # Parse chapter + bible
         chapter_content = full_output
         new_bible = None
-
         if "```json" in full_output:
             parts = full_output.split("```json")
             chapter_content = parts[0].strip()
             try:
-                import json, re
                 json_str = re.search(r'\{.*\}', parts[1], re.DOTALL).group(0)
                 new_bible = json_str
             except:
                 pass
 
-        # Save chapter
+        # Save to DB
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("""INSERT INTO chapters (story_id, chapter_num, content, choice_made, created_at)
                      VALUES (?, ?, ?, ?, ?)""",
                   (story_id, chapter_num, chapter_content, user_choice or "初始章", datetime.now().isoformat()))
         c.execute("UPDATE stories SET current_chapter = ? WHERE story_id = ?", (chapter_num, story_id))
-
-        # Update Story Bible if we got one
         if new_bible:
             c.execute("UPDATE stories SET story_bible = ? WHERE story_id = ?", (new_bible, story_id))
-
         conn.commit()
         conn.close()
 
+        logger.info(f"Chapter {chapter_num} saved successfully for story {story_id}")
         return chapter_content, chapter_num
+
     except Exception as e:
+        logger.error(f"Generation error: {e}")
         return f"生成故事時發生錯誤：{e}", chapter_num
 
 # ====================== HANDLERS ======================
@@ -298,6 +341,46 @@ async def load_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ====================== IMAGE GENERATION ======================
+
+async def generate_image_for_chapter(chapter_content: str, story_id: int, chapter_num: int) -> str:
+    """Generate an image for the chapter based on IMAGE_MODE."""
+    prompt = f"電影感構圖，繁體中文故事場景：{chapter_content[:400]}... 高質素、細膩光影、角色表情豐富"
+
+    if IMAGE_MODE == "comfyui":
+        try:
+            # Placeholder for real ComfyUI workflow trigger
+            logger.info(f"[ComfyUI] Would generate image for story {story_id} chapter {chapter_num}")
+            return f"[ComfyUI] 圖像已生成（開發中） - {chapter_num}.png"
+        except Exception as e:
+            logger.error(f"ComfyUI error: {e}")
+            return None
+    else:
+        # Grok Imagine (currently not available via public API)
+        logger.info(f"[Grok Imagine] Image generation requested but not yet available via API.")
+        return None
+
+
+async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global IMAGE_MODE
+    args = context.args
+    if not args or args[0].lower() not in ["groq", "comfyui"]:
+        await update.message.reply_text("請輸入 `/image_mode groq` 或 `/image_mode comfyui`")
+        return
+    IMAGE_MODE = args[0].lower()
+    await update.message.reply_text(f"✅ 圖像生成模式已切換為：{IMAGE_MODE}")
+
+
+async def test_guardrail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    story_id = context.user_data.get("current_story_id")
+    if not story_id:
+        await update.message.reply_text("請先載入一個故事（/loadstory <ID>）")
+        return
+    sample = "Sley 突然變成冷酷殺手，忘記了他一直以來的熱血性格。"
+    result = check_story_consistency(sample, story_id)
+    await update.message.reply_text(f"Guardrail 測試結果：\n{json.dumps(result, ensure_ascii=False, indent=2)}")
+
+
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     story_id = context.user_data.get("current_story_id")
@@ -318,7 +401,15 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Parse and store new choices for next turn
     context.user_data["last_choices"] = parse_choices(chapter_text)
 
-    await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}")
+    # Handle "I" option for image generation
+    if resolved_choice.upper().startswith("I)"):
+        image_result = await generate_image_for_chapter(chapter_text, story_id, ch_num)
+        if image_result:
+            await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n🖼️ {image_result}")
+        else:
+            await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n（圖像生成暫時無法使用）")
+    else:
+        await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -326,9 +417,11 @@ def main():
     app.add_handler(CommandHandler("newstory", new_story))
     app.add_handler(CommandHandler("mystories", list_my_stories))
     app.add_handler(CommandHandler("loadstory", load_story))
+    app.add_handler(CommandHandler("image_mode", set_image_mode))
+    app.add_handler(CommandHandler("test_guardrail", test_guardrail))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice))
 
-    print("📖 sleyStory bot is running...")
+    print("📖 sleyStory bot is running... (Hybrid Grok + Local Guardrail mode)")
     app.run_polling()
 
 if __name__ == "__main__":
