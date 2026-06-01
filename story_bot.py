@@ -6,6 +6,7 @@ Follows the interactive-story-generator skill rules.
 
 import asyncio
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime
@@ -84,6 +85,16 @@ def load_story_context(story_id: int) -> dict:
     }
 
 
+def parse_choices(chapter_text: str) -> dict:
+    """Extract A/B/C/D/E/I choices from chapter text."""
+    choices = {}
+    pattern = r'^([A-EI])\)\s*(.+?)(?=\n[A-EI]\)|$)' 
+    matches = re.findall(pattern, chapter_text, re.MULTILINE | re.DOTALL)
+    for letter, desc in matches:
+        choices[letter] = desc.strip()
+    return choices
+
+
 def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str = "", is_first: bool = False) -> tuple:
     ctx = load_story_context(story_id)
     chapter_num = ctx["current_chapter"] + (0 if is_first else 1)
@@ -93,6 +104,7 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
         "你必須維持故事的原始風格、角色性格、世界觀與氛圍，直到第20章都不改變。"
         "每次產生 800-1800 字的詳細章節，包含大量對話、關係發展、真實後果。"
         "⚠️ 每章結尾「必須」包含 A/B/C/D/E/I 選項，否則用戶無法繼續。絕對不要省略選項部分！"
+        "⚠️ 絕對不要在章節開頭輸出任何 meta 說明、思考過程或「本章節的內容為根據...」。直接從章節標題開始。"
     )
 
     if is_first:
@@ -113,6 +125,7 @@ E) [選項E — 可選]
 I) [生成本篇圖像] （為本章最重要場面生成AI圖像）
 
 ⚠️ 每章結尾「必須」包含以上選項格式，絕對不要省略！
+⚠️ 絕對不要在章節開頭輸出任何 meta 說明或思考過程。直接從章節標題開始。
 
 然後在章節結束後，輸出一個 JSON Story Bible（用 ```json 包起來），包含：
 {{
@@ -146,7 +159,8 @@ D) [選項D]
 E) [選項E — 可選]
 I) [生成本篇圖像] （為本章最重要場面生成AI圖像）
 
-絕對不要省略選項部分！格式必須完全符合技能文件規定。"""
+絕對不要省略選項部分！格式必須完全符合技能文件規定。
+⚠️ 絕對不要在章節開頭輸出任何 meta 說明、思考過程或「本章節的內容為根據...」。直接從章節標題開始。"""
 
     try:
         response = client.chat.completions.create(
@@ -222,6 +236,9 @@ async def new_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chapter1, _ = generate_chapter(story_id, initial_prompt=prompt, is_first=True)
 
+    # Parse and store choices for future letter resolution
+    context.user_data["last_choices"] = parse_choices(chapter1)
+
     await update.message.reply_text(
         f"✅ 新故事已建立！Story ID: `{story_id}`\n"
         f"以後可以用 `/loadstory {story_id}` 繼續這個故事。\n\n"
@@ -274,6 +291,7 @@ async def load_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["current_story_id"] = story_id
+    context.user_data.pop("last_choices", None)  # reset choices when switching stories
     await update.message.reply_text(
         f"✅ 已載入 Story ID `{story_id}`！\n"
         f"現在可以直接輸入 A / B / C / D / E / I 繼續故事。"
@@ -288,7 +306,18 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("請先用 /newstory 開始一個新故事。")
         return
 
-    chapter_text, ch_num = generate_chapter(story_id, user_choice=text)
+    # Resolve single-letter choice (A/B/C/D/E/I) to full choice text
+    last_choices = context.user_data.get("last_choices", {})
+    if text.upper() in last_choices:
+        resolved_choice = f"{text.upper()}) {last_choices[text.upper()]}"
+    else:
+        resolved_choice = text
+
+    chapter_text, ch_num = generate_chapter(story_id, user_choice=resolved_choice)
+
+    # Parse and store new choices for next turn
+    context.user_data["last_choices"] = parse_choices(chapter_text)
+
     await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}")
 
 def main():
