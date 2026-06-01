@@ -1,9 +1,31 @@
 #!/usr/bin/env python3
 """
-Save a new chapter and update long-term memory for a story.
+Save a new chapter and update long-term memory + character/relationship state for a story.
 Usage: python save_chapter.py <story_id> <chapter_num> "<chapter_title>" "<full_content>" "<choice_made>" '<memory_summary_json>'
-Where memory_summary_json is a JSON string like:
-{"summary": "Protagonist met ally and discovered clue.", "key_events": ["met ally", "found map"], "character_states": {"protagonist": "curious and determined"}, "plot_tension": 7, "user_feedback": []}
+
+memory_summary_json now supports optional v3 fields:
+{
+  "summary": "...",
+  "key_events": [...],
+  ...
+  "updated_characters": {
+    "角色名": {
+      "short_term_goal": "...",
+      "mid_term_goal": "...",
+      "long_term_goal": "...",
+      "current_state": "..."
+    }
+  },
+  "updated_relationships": [
+    {
+      "character_a": "角色A",
+      "character_b": "角色B",
+      "trust_level": 75,
+      "affection_level": 30,
+      "relationship_summary": "..."
+    }
+  ]
+}
 """
 import sqlite3
 import sys
@@ -48,10 +70,63 @@ def save_chapter(story_id, chapter_num, title, content, choice_made, memory_json
         SET current_chapter = ?, last_updated = CURRENT_TIMESTAMP
         WHERE id = ?
     ''', (chapter_num, story_id))
-    
+
+    # v3 - Handle character and relationship updates from memory_json
+    updated_characters = mem.get("updated_characters", {})
+    updated_relationships = mem.get("updated_relationships", [])
+
+    for name, data in updated_characters.items():
+        cursor.execute('''
+            INSERT INTO characters (story_id, name, short_term_goal, mid_term_goal, long_term_goal,
+                                    personality, mbti, appearance, abilities, traits, items, background, current_state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(story_id, name) DO UPDATE SET
+                short_term_goal = excluded.short_term_goal,
+                mid_term_goal = excluded.mid_term_goal,
+                long_term_goal = excluded.long_term_goal,
+                current_state = excluded.current_state,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (
+            story_id, name,
+            data.get("short_term_goal"), data.get("mid_term_goal"), data.get("long_term_goal"),
+            data.get("personality"), data.get("mbti"), data.get("appearance"),
+            json.dumps(data.get("abilities", [])) if data.get("abilities") else None,
+            data.get("traits"),
+            json.dumps(data.get("items", [])) if data.get("items") else None,
+            data.get("background"),
+            data.get("current_state")
+        ))
+
+    for rel in updated_relationships:
+        cursor.execute('''
+            INSERT INTO character_relationships (story_id, character_a, character_b, relationship_type,
+                                                 trust_level, affection_level, tension_level,
+                                                 relationship_summary, history_summary, last_interaction_chapter)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(story_id, character_a, character_b) DO UPDATE SET
+                relationship_type = excluded.relationship_type,
+                trust_level = excluded.trust_level,
+                affection_level = excluded.affection_level,
+                tension_level = excluded.tension_level,
+                relationship_summary = excluded.relationship_summary,
+                history_summary = excluded.history_summary,
+                last_interaction_chapter = excluded.last_interaction_chapter,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (
+            story_id,
+            rel.get("character_a"), rel.get("character_b"),
+            rel.get("relationship_type"),
+            rel.get("trust_level", 50),
+            rel.get("affection_level", 0),
+            rel.get("tension_level", 0),
+            rel.get("relationship_summary"),
+            rel.get("history_summary"),
+            rel.get("last_interaction_chapter", chapter_num)
+        ))
+
     conn.commit()
     conn.close()
-    print(f"Chapter {chapter_num} saved for story {story_id}. Memory updated.")
+    print(f"Chapter {chapter_num} saved for story {story_id}. Memory + character/relationship updates applied.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 7:

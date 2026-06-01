@@ -63,6 +63,49 @@ def init_db():
         )
     ''')
     
+    # v3 - Character consistency tables
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS characters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            story_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            short_term_goal TEXT,
+            mid_term_goal TEXT,
+            long_term_goal TEXT,
+            personality TEXT,
+            mbti TEXT,
+            appearance TEXT,
+            abilities TEXT,           -- JSON array 格式，例如 ["超強記憶力", "精通格鬥"]
+            traits TEXT,
+            items TEXT,               -- JSON array 格式
+            background TEXT,
+            current_state TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE,
+            UNIQUE(story_id, name)
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS character_relationships (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            story_id INTEGER NOT NULL,
+            character_a TEXT NOT NULL,
+            character_b TEXT NOT NULL,
+            relationship_type TEXT,           -- 父親、情侶、敵人、盟友、暗戀、師徒、競爭對手...
+            trust_level INTEGER DEFAULT 50,   -- 0-100
+            affection_level INTEGER DEFAULT 0,
+            tension_level INTEGER DEFAULT 0,
+            relationship_summary TEXT,
+            history_summary TEXT,
+            last_interaction_chapter INTEGER,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE,
+            UNIQUE(story_id, character_a, character_b)
+        )
+    ''')
+
     conn.commit()
     conn.close()
     print(f"Database initialized successfully at {DB_PATH}")

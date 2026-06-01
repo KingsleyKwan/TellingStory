@@ -17,6 +17,28 @@ description: Generate interactive branching stories in Traditional Chinese chapt
   - Explicit rule: "Never forget or contradict established facts. Prioritize Story Bible over old raw text."
 - **Realistic Stakes Rule**: Not everything succeeds. Choices can lead to **partial failure, setbacks, complications, or unintended consequences**. Protagonist is not invincible. Drama comes from struggle and realistic outcomes.
 
+## 角色一致性強制檢查系統（v3 - 最高優先級）
+
+**每次生成任何角色行動、對話、內心獨白之前，必須執行以下步驟：**
+
+1. 從 `characters` table 取出該角色完整資料（包括 name、性格、mbti、外型、能力、特點、持有物品、短期/中期/長期目標、current_state）
+2. 從 `character_relationships` table 取出所有相關關係（character_a / character_b 雙向查詢）
+3. 在內部思考（CoT）中**明確寫出**以下檢查文字：
+
+【角色一致性檢查】
+- 角色：[姓名]  
+  性格 + MBTI = [性格描述 + MBTI]  
+  長期目標 = [...]  
+  中期目標 = [...]  
+  短期目標 = [...]  
+  目前狀態 = [...]  
+  持有物品 = [...]  
+- 與 [對象角色] 關係 = [relationship_type]，信任度=[數字]，好感度=[數字]，目前關係摘要 = [...]
+- 現在嘅行動/對話/決定是否 100% 符合以上所有設定？
+  → 如果唔符合，必須調整內容，或者讓行動自然失敗並產生後果（例如信任度下降、關係惡化、性格衝突等）。
+
+**嚴禁**：角色突然改變性格、忘記目標、做出違反關係嘅行為。
+
 ## Mandatory Response Structure (繁體中文)
 **第 X 章：【章節標題】**
 
@@ -33,10 +55,10 @@ E) [選項E — 可選]
 **（內部記憶更新 — 不顯示給用戶）**
 
 After user chooses, immediately:
-1. Load categorized memory + Story Bible + relevant events.
+1. Load categorized memory + Story Bible + relevant events + **characters table + character_relationships table**.
 2. Generate next chapter in **繁體中文**, incorporating choice consequences (including possible failure).
-3. Update Story Bible + categorized memories.
-4. Save to database.
+3. Update Story Bible + categorized memories + **characters + relationships** (use updated_characters / updated_relationships in memory_json).
+4. Save to database via save_chapter.py.
 5. Present new choices.
 
 ## Categorized Memory Structure (Database)
@@ -79,14 +101,17 @@ We use enhanced JSON in the `memories` table + dedicated fields:
 }
 ```
 
-**Database Tables (updated)**:
+**Database Tables (updated v3)**:
 - `stories` — same + `story_bible` (JSON column)
 - `chapters` — full content (繁體中文)
 - `memories` — now includes: `story_bible_snapshot`, `categorized_events` (JSON array of detailed events), `locations_state`, `characters_state`, `relationships_map`
+- `characters` — 角色詳細資料（目標、性格、MBTI、外型、能力、物品、current_state）
+- `character_relationships` — 雙向關係表（信任度、好感度、關係類型、歷史摘要）
 
 **Long-Story Rules (Never Violate)**:
 - Before every generation: "Load Story Bible first. Only pull recent events and relevant characters. If context is long, summarize older events but keep core facts 100% consistent."
-- Character backgrounds and personality **never drift** — always reference current_state from memory.
+- **v3 強制**：每次生成前必須執行「角色一致性強制檢查系統」，從 characters + character_relationships 讀取完整資料。
+- Character backgrounds and personality **never drift** — always reference current_state, goals, MBTI, relationships from the dedicated tables.
 - Choices must offer **real risk**. Example: Option A might succeed partially but create new enemy; Option C might fail completely and force retreat.
 - Protagonist can be injured, lose allies, get exposed, or make moral compromises.
 
@@ -99,9 +124,9 @@ We use enhanced JSON in the `memories` table + dedicated fields:
 - Save detailed first event + initial characters/locations.
 
 **Continuing Long Story**
-- Always load: Story Bible + last 2 chapters summary + relevant categorized events (by location/character/plot thread).
+- Always load: Story Bible + last 2 chapters summary + relevant categorized events + **characters table + character_relationships table**.
 - Never rely on raw full history if >10 chapters — use Bible + indexed events.
-- After chapter: Update Story Bible (merge new info), add new detailed Event record, update character/location states.
+- After chapter: Update Story Bible (merge new info), add new detailed Event record, **update characters + relationships** (via updated_characters / updated_relationships), update character/location states.
 
 **Fine-Tuning**
 - Same as before, but now also store language/style prefs (e.g. "more poetic descriptions", "darker tone", "more dialogue").
@@ -111,10 +136,10 @@ We use enhanced JSON in the `memories` table + dedicated fields:
 - "更新記憶：..." (user can manually correct facts)
 - "fine tune: 增加失敗風險" or "讓故事更寫實，不要主角光環"
 
-## Scripts (Updated for v2)
-- `init_db.py` — now creates enhanced columns (story_bible, etc.)
-- `save_chapter.py` — saves full chapter + updates Story Bible + adds detailed event
-- `load_context.py` — returns rich categorized context + Story Bible
+## Scripts (Updated for v3)
+- `init_db.py` — creates characters + character_relationships tables
+- `save_chapter.py` — saves chapter + memory + **character/relationship updates**
+- `load_context.py` — returns rich context + **characters + relationships**
 - `list_stories.py`, `update_style.py` — unchanged
 
 All future stories will follow this structure to support **真正長篇連載** without memory collapse or unrealistic plotting.
@@ -146,3 +171,5 @@ All future stories will follow this structure to support **真正長篇連載** 
 我會立刻載入新規則，生成**繁體中文第1章**，並儲存詳細分類記憶。 
 
 準備好了嗎？ 😊
+
+v3 更新完成 - 角色一致性已大幅強化

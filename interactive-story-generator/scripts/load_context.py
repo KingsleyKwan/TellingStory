@@ -55,6 +55,50 @@ def load_context(story_id, num_last=3):
             "last_chapter_num": mem_row[5]
         }
     
+    # v3 - Load characters
+    cursor.execute('''
+        SELECT name, short_term_goal, mid_term_goal, long_term_goal, personality, mbti,
+               appearance, abilities, traits, items, background, current_state
+        FROM characters WHERE story_id = ?
+    ''', (story_id,))
+    char_rows = cursor.fetchall()
+    characters = {}
+    for row in char_rows:
+        characters[row[0]] = {
+            "short_term_goal": row[1],
+            "mid_term_goal": row[2],
+            "long_term_goal": row[3],
+            "personality": row[4],
+            "mbti": row[5],
+            "appearance": row[6],
+            "abilities": json.loads(row[7]) if row[7] else [],
+            "traits": row[8],
+            "items": json.loads(row[9]) if row[9] else [],
+            "background": row[10],
+            "current_state": row[11]
+        }
+
+    # v3 - Load relationships
+    cursor.execute('''
+        SELECT character_a, character_b, relationship_type, trust_level, affection_level,
+               tension_level, relationship_summary, history_summary, last_interaction_chapter
+        FROM character_relationships WHERE story_id = ?
+    ''', (story_id,))
+    rel_rows = cursor.fetchall()
+    relationships = [
+        {
+            "character_a": r[0],
+            "character_b": r[1],
+            "relationship_type": r[2],
+            "trust_level": r[3],
+            "affection_level": r[4],
+            "tension_level": r[5],
+            "relationship_summary": r[6],
+            "history_summary": r[7],
+            "last_interaction_chapter": r[8]
+        } for r in rel_rows
+    ]
+
     context = {
         "story_id": story_id,
         "title": title,
@@ -65,11 +109,13 @@ def load_context(story_id, num_last=3):
             {
                 "num": ch[0],
                 "title": ch[1],
-                "content": ch[2][:500] + "..." if len(ch[2]) > 500 else ch[2],  # truncated for context
+                "content": ch[2][:500] + "..." if len(ch[2]) > 500 else ch[2],
                 "choice_made": ch[3]
             } for ch in reversed(chapters)
         ],
-        "memory": memory
+        "memory": memory,
+        "characters": characters,
+        "relationships": relationships
     }
     
     conn.close()
