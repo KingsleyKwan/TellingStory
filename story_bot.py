@@ -212,7 +212,33 @@ GROK_SYSTEM_PROMPT = """【最高優先級規則 - 角色一致性】
 你必須維持故事的原始風格、角色性格、世界觀與氛圍，直到第20章都不改變。
 每次產生 800-1800 字的詳細章節，包含大量對話、關係發展、真實後果。
 ⚠️ 每章結尾「必須」包含 A/B/C/D/E/I 選項，絕對不要省略！
-⚠️ 絕對不要在章節開頭輸出任何 meta 說明，直接從章節標題開始。"""
+⚠️ 絕對不要在章節開頭輸出任何 meta 說明，直接從章節標題開始。
+
+【JSON Story Bible 格式要求】
+每章結束時，請在 ```json 區塊輸出以下結構（盡量使用此格式）：
+{
+  "updated_characters": {
+    "角色名": {
+      "short_term_goal": "...",
+      "mid_term_goal": "...",
+      "long_term_goal": "...",
+      "personality": "...",
+      "mbti": "...",
+      "current_state": "..."
+    }
+  },
+  "updated_relationships": [
+    {
+      "character_a": "角色A",
+      "character_b": "角色B",
+      "relationship_type": "朋友/情侶/敵人...",
+      "trust_level": 65,
+      "affection_level": 40,
+      "tension_level": 10,
+      "relationship_summary": "..."
+    }
+  ]
+}"""
 
 
 def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str = "", is_first: bool = False) -> tuple:
@@ -244,7 +270,7 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
 
     if is_first:
         user_msg = f"""用戶想要的故事主題與風格：{initial_prompt or '未指定'}
-請生成第 1 章（繁體中文），嚴格遵守角色一致性規則。格式必須包含章節標題 + 敘事 + A/B/C/D/E/I 選項 + ```json Story Bible。"""
+請生成第 1 章（繁體中文），嚴格遵守角色一致性規則。格式必須包含章節標題 + 敘事 + A/B/C/D/E/I 選項 + ```json Story Bible（使用 updated_characters + updated_relationships 格式）。"""
     else:
         user_msg = f"""目前 Story Bible：
 {ctx['story_bible']}
@@ -257,7 +283,7 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
 {char_context}
 {rel_context}
 
-請嚴格遵守角色一致性規則，生成第 {chapter_num} 章（繁體中文），並更新 Story Bible（JSON）。"""
+請嚴格遵守角色一致性規則，生成第 {chapter_num} 章（繁體中文），並更新 Story Bible（JSON，使用 updated_characters + updated_relationships 格式）。"""
 
     if not grok_client:
         return "錯誤：未設定 GROK_API_KEY，無法使用 Grok 生成故事。", chapter_num
@@ -306,14 +332,16 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
         # Parse chapter + bible
         chapter_content = full_output
         new_bible = None
+        parsed_json = None
         if "```json" in full_output:
             parts = full_output.split("```json")
             chapter_content = parts[0].strip()
             try:
                 json_str = re.search(r'\{.*\}', parts[1], re.DOTALL).group(0)
                 new_bible = json_str
-            except:
-                pass
+                parsed_json = json.loads(json_str)
+            except Exception as e:
+                logger.warning(f"Failed to parse Story Bible JSON: {e}")
 
         # Save to DB
         conn = sqlite3.connect(DB_PATH)
@@ -324,6 +352,143 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
         c.execute("UPDATE stories SET current_chapter = ? WHERE story_id = ?", (chapter_num, story_id))
         if new_bible:
             c.execute("UPDATE stories SET story_bible = ? WHERE story_id = ?", (new_bible, story_id))
+
+        # ====================== v3 AUTO-SYNC: characters + relationships + memories ======================
+        if parsed_json:
+            try:
+                # Try multiple possible JSON structures
+                char_data = None
+                rel_data = None
+
+                # Format 1: updated_characters + updated_relationships (ideal)
+                if "updated_characters" in parsed_json:
+                    char_data = parsed_json["updated_characters"]
+                if "updated_relationships" in parsed_json:
+                    rel_data = parsed_json["updated_relationships"]
+
+                # Format 2: characters + relationships
+                if not char_data and "characters" in parsed_json:
+                    char_data = parsed_json["characters"]
+                if not rel_data and "relationships" in parsed_json:
+                    rel_data = parsed_json["relationships"]
+
+                # Format 3: Story Bible → protagonist + relationships (current observed format)
+                if not char_data and "Story Bible" in parsed_json:
+                    sb = parsed_json["Story Bible"]
+                    if "protagonist" in sb:
+                        char_data = {sb["protagonist"]["name"]: sb["protagonist"]}
+                    if "relationships" in sb:
+                        rel_data = sb["relationships"]
+
+                # Format 4: main_characters
+                if not char_data and "main_characters" in parsed_json:
+                    char_data = parsed_json["main_characters"]
+
+                # Insert / Update characters
+                if char_data and isinstance(char_data, dict):
+                    for name, info in char_data.items():
+                        if not isinstance(info, dict):
+                            continue
+                        c.execute('''
+                            INSERT INTO characters (story_id, name, short_term_goal, mid_term_goal, long_term_goal,
+                                                    personality, mbti, appearance, abilities, traits, items,
+                                                    background, current_state)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(story_id, name) DO UPDATE SET
+                                short_term_goal = excluded.short_term_goal,
+                                mid_term_goal = excluded.mid_term_goal,
+                                long_term_goal = excluded.long_term_goal,
+                                personality = excluded.personality,
+                                mbti = excluded.mbti,
+                                appearance = excluded.appearance,
+                                abilities = excluded.abilities,
+                                traits = excluded.traits,
+                                items = excluded.items,
+                                background = excluded.background,
+                                current_state = excluded.current_state,
+                                updated_at = CURRENT_TIMESTAMP
+                        ''', (
+                            story_id, name,
+                            info.get("short_term_goal") or info.get("short_term_goal"),
+                            info.get("mid_term_goal"),
+                            info.get("long_term_goal"),
+                            info.get("personality"),
+                            info.get("mbti"),
+                            info.get("appearance"),
+                            json.dumps(info.get("abilities", [])) if info.get("abilities") else None,
+                            info.get("traits"),
+                            json.dumps(info.get("items", [])) if info.get("items") else None,
+                            info.get("background"),
+                            info.get("current_state")
+                        ))
+                    logger.info(f"Synced {len(char_data)} characters for story {story_id}")
+
+                # Insert / Update relationships
+                if rel_data:
+                    if isinstance(rel_data, dict):
+                        # Convert dict format {"小櫻": {"type":.., "trust":..}} to list
+                        rel_list = []
+                        for char_b, rel_info in rel_data.items():
+                            if isinstance(rel_info, dict):
+                                rel_list.append({
+                                    "character_a": char_data.get("name", "sley") if char_data else "sley",
+                                    "character_b": char_b,
+                                    "relationship_type": rel_info.get("type") or rel_info.get("relationship_type"),
+                                    "trust_level": rel_info.get("trust"),
+                                    "affection_level": rel_info.get("affection"),
+                                    "tension_level": rel_info.get("tension")
+                                })
+                        rel_data = rel_list
+
+                    if isinstance(rel_data, list):
+                        for rel in rel_data:
+                            if not isinstance(rel, dict):
+                                continue
+                            c.execute('''
+                                INSERT INTO character_relationships (story_id, character_a, character_b,
+                                                                     relationship_type, trust_level, affection_level,
+                                                                     tension_level, relationship_summary, last_interaction_chapter)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(story_id, character_a, character_b) DO UPDATE SET
+                                    relationship_type = excluded.relationship_type,
+                                    trust_level = excluded.trust_level,
+                                    affection_level = excluded.affection_level,
+                                    tension_level = excluded.tension_level,
+                                    relationship_summary = excluded.relationship_summary,
+                                    last_interaction_chapter = excluded.last_interaction_chapter,
+                                    updated_at = CURRENT_TIMESTAMP
+                            ''', (
+                                story_id,
+                                rel.get("character_a") or rel.get("from"),
+                                rel.get("character_b") or rel.get("to"),
+                                rel.get("relationship_type") or rel.get("type"),
+                                rel.get("trust_level") or rel.get("trust"),
+                                rel.get("affection_level") or rel.get("affection"),
+                                rel.get("tension_level") or rel.get("tension"),
+                                rel.get("relationship_summary"),
+                                chapter_num
+                            ))
+                        logger.info(f"Synced {len(rel_data)} relationships for story {story_id}")
+
+                # Insert memory record (simple event summary)
+                c.execute('''
+                    INSERT INTO memories (story_id, memory_type, key, value, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    story_id,
+                    "chapter_event",
+                    f"chapter_{chapter_num}",
+                    json.dumps({
+                        "chapter": chapter_num,
+                        "choice": user_choice,
+                        "summary": chapter_content[:300] + "..."
+                    }, ensure_ascii=False),
+                    datetime.now().isoformat()
+                ))
+
+            except Exception as e:
+                logger.warning(f"Failed to sync v3 tables from Story Bible: {e}")
+
         conn.commit()
         conn.close()
 
