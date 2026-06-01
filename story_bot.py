@@ -59,24 +59,24 @@ def init_db():
 
 init_db()
 
-# ====================== STORY GENERATION ======================
+# ====================== STORY GENERATION (with Story Bible) ======================
 def load_story_context(story_id: int) -> dict:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
     c.execute("SELECT story_bible, current_chapter FROM stories WHERE story_id = ?", (story_id,))
     row = c.fetchone()
-    initial_prompt = row[0] if row else ""
+    story_bible = row[0] if row else "{}"
     current_chapter = row[1] if row else 1
 
     c.execute("""SELECT chapter_num, content, choice_made 
                  FROM chapters WHERE story_id = ? 
-                 ORDER BY chapter_num DESC LIMIT 3""", (story_id,))
+                 ORDER BY chapter_num DESC LIMIT 4""", (story_id,))
     recent = c.fetchall()
     conn.close()
 
     return {
-        "initial_prompt": initial_prompt,
+        "story_bible": story_bible,
         "current_chapter": current_chapter,
         "recent_chapters": recent[::-1]
     }
@@ -86,39 +86,46 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
     ctx = load_story_context(story_id)
     chapter_num = ctx["current_chapter"] + (0 if is_first else 1)
 
-    system_prompt = "你是專業的繁體中文長篇互動故事生成器，嚴格遵守 interactive-story-generator 規則。每次必須產生 800-1800 字的詳細章節，包含大量對話、關係發展、真實後果，並嚴格按照指定格式輸出。"
+    system_prompt = (
+        "你是專業的繁體中文長篇互動故事生成器，嚴格遵守 interactive-story-generator 規則。"
+        "你必須維持故事的原始風格、角色性格、世界觀與氛圍，直到第20章都不改變。"
+        "每次產生 800-1800 字的詳細章節，包含大量對話、關係發展、真實後果。"
+    )
 
     if is_first:
-        user_msg = f"""用戶想要的故事主題：{initial_prompt or '未指定'}
+        user_msg = f"""用戶想要的故事主題與風格：{initial_prompt or '未指定'}
 
-請嚴格按照以下格式生成**第 1 章**（繁體中文，800-1800字）：
+請先生成**第 1 章**（繁體中文，800-1800字），格式如下：
 
 **第 1 章：【章節標題】**
 
-[沉浸式繁體中文敘事，包含大量自然對話、細膩描寫表情動作衣着氣氛感官與心理。]
+[沉浸式繁體中文敘事...]
 
 **你接下來要怎麼做？**
-A) [選項A]
-B) [選項B]
-C) [選項C]
-D) [選項D]
-E) [選項E]
+A) ...
 I) [生成本篇圖像]
+
+然後在章節結束後，輸出一個 JSON Story Bible（用 ```json 包起來），包含：
+{{
+  "core_style": "故事的核心風格與氛圍描述（例如：輕鬆日常、溫暖幽默、專注小細節）",
+  "main_characters": {{"角色名": "背景與性格"}},
+  "world_rules": "世界觀與重要設定",
+  "tone_rules": "絕對不能出現的元素或必須保持的元素"
+}}
 
 （內部記憶更新 — 不顯示給用戶）"""
     else:
-        history = "\n\n".join([f"第 {ch[0]} 章：\n{ch[1][:300]}..." for ch in ctx["recent_chapters"]])
-        user_msg = f"""這是故事的第 {chapter_num} 章。
+        history = "\n\n".join([f"第 {ch[0]} 章選擇：{ch[2]}" for ch in ctx["recent_chapters"]])
+        user_msg = f"""目前 Story Bible：
+{ctx['story_bible']}
+
+這是故事的第 {chapter_num} 章。
 用戶選擇：{user_choice}
 
-之前章節摘要：
+之前章節選擇記錄：
 {history}
 
-請嚴格按照 Mandatory Response Structure 生成第 {chapter_num} 章（繁體中文），包含：
-- 大量對話與關係發展
-- 真實後果（可能失敗或 setback）
-- 提供 A-E + I 選項
-格式必須完全符合技能文件中的規定。"""
+請嚴格維持 Story Bible 中定義的風格，生成第 {chapter_num} 章（繁體中文），並在章節後更新 Story Bible（JSON）。格式必須完全符合技能文件規定。"""
 
     try:
         response = client.chat.completions.create(
@@ -127,22 +134,41 @@ I) [生成本篇圖像]
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg}
             ],
-            temperature=0.85,
-            max_tokens=2800
+            temperature=0.82,
+            max_tokens=3000
         )
-        content = response.choices[0].message.content.strip()
+        full_output = response.choices[0].message.content.strip()
 
-        # Save chapter to DB
+        # Split chapter content and possible bible update
+        chapter_content = full_output
+        new_bible = None
+
+        if "```json" in full_output:
+            parts = full_output.split("```json")
+            chapter_content = parts[0].strip()
+            try:
+                import json, re
+                json_str = re.search(r'\{.*\}', parts[1], re.DOTALL).group(0)
+                new_bible = json_str
+            except:
+                pass
+
+        # Save chapter
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("""INSERT INTO chapters (story_id, chapter_num, content, choice_made, created_at)
                      VALUES (?, ?, ?, ?, ?)""",
-                  (story_id, chapter_num, content, user_choice or "初始章", datetime.now().isoformat()))
+                  (story_id, chapter_num, chapter_content, user_choice or "初始章", datetime.now().isoformat()))
         c.execute("UPDATE stories SET current_chapter = ? WHERE story_id = ?", (chapter_num, story_id))
+
+        # Update Story Bible if we got one
+        if new_bible:
+            c.execute("UPDATE stories SET story_bible = ? WHERE story_id = ?", (new_bible, story_id))
+
         conn.commit()
         conn.close()
 
-        return content, chapter_num
+        return chapter_content, chapter_num
     except Exception as e:
         return f"生成故事時發生錯誤：{e}", chapter_num
 
