@@ -75,6 +75,48 @@ def init_db():
         value TEXT,
         updated_at TEXT
     )''')
+
+    # v3 - Character consistency tables
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS characters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            story_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            short_term_goal TEXT,
+            mid_term_goal TEXT,
+            long_term_goal TEXT,
+            personality TEXT,
+            mbti TEXT,
+            appearance TEXT,
+            abilities TEXT,
+            traits TEXT,
+            items TEXT,
+            background TEXT,
+            current_state TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(story_id, name)
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS character_relationships (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            story_id INTEGER NOT NULL,
+            character_a TEXT NOT NULL,
+            character_b TEXT NOT NULL,
+            relationship_type TEXT,
+            trust_level INTEGER DEFAULT 50,
+            affection_level INTEGER DEFAULT 0,
+            tension_level INTEGER DEFAULT 0,
+            relationship_summary TEXT,
+            history_summary TEXT,
+            last_interaction_chapter INTEGER,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(story_id, character_a, character_b)
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -94,12 +136,54 @@ def load_story_context(story_id: int) -> dict:
                  FROM chapters WHERE story_id = ? 
                  ORDER BY chapter_num DESC LIMIT 4""", (story_id,))
     recent = c.fetchall()
+
+    # v3 - Load characters (gracefully handle if table is empty)
+    try:
+        c.execute("""
+            SELECT name, short_term_goal, mid_term_goal, long_term_goal,
+                   personality, mbti, appearance, abilities, traits, items,
+                   background, current_state
+            FROM characters WHERE story_id = ?
+        """, (story_id,))
+        char_rows = c.fetchall()
+        characters = {}
+        for r in char_rows:
+            characters[r[0]] = {
+                "short_term_goal": r[1], "mid_term_goal": r[2], "long_term_goal": r[3],
+                "personality": r[4], "mbti": r[5], "appearance": r[6],
+                "abilities": json.loads(r[7]) if r[7] else [],
+                "traits": r[8], "items": json.loads(r[9]) if r[9] else [],
+                "background": r[10], "current_state": r[11]
+            }
+    except:
+        characters = {}
+
+    # v3 - Load relationships
+    try:
+        c.execute("""
+            SELECT character_a, character_b, relationship_type, trust_level,
+                   affection_level, tension_level, relationship_summary
+            FROM character_relationships WHERE story_id = ?
+        """, (story_id,))
+        rel_rows = c.fetchall()
+        relationships = [
+            {
+                "character_a": r[0], "character_b": r[1], "relationship_type": r[2],
+                "trust_level": r[3], "affection_level": r[4], "tension_level": r[5],
+                "relationship_summary": r[6]
+            } for r in rel_rows
+        ]
+    except:
+        relationships = {}
+
     conn.close()
 
     return {
         "story_bible": story_bible,
         "current_chapter": current_chapter,
-        "recent_chapters": recent[::-1]
+        "recent_chapters": recent[::-1],
+        "characters": characters,
+        "relationships": relationships
     }
 
 
