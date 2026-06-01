@@ -4,8 +4,10 @@ sleyStory - Interactive Storytelling Bot (繁體中文長篇版)
 Follows the interactive-story-generator skill rules.
 """
 
+import asyncio
 import os
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -90,6 +92,7 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
         "你是專業的繁體中文長篇互動故事生成器，嚴格遵守 interactive-story-generator 規則。"
         "你必須維持故事的原始風格、角色性格、世界觀與氛圍，直到第20章都不改變。"
         "每次產生 800-1800 字的詳細章節，包含大量對話、關係發展、真實後果。"
+        "⚠️ 每章結尾「必須」包含 A/B/C/D/E/I 選項，否則用戶無法繼續。絕對不要省略選項部分！"
     )
 
     if is_first:
@@ -102,8 +105,14 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
 [沉浸式繁體中文敘事...]
 
 **你接下來要怎麼做？**
-A) ...
-I) [生成本篇圖像]
+A) [選項A — 簡短誘人描述]
+B) [選項B — 會帶來不同走向]
+C) [選項C]
+D) [選項D]
+E) [選項E — 可選]
+I) [生成本篇圖像] （為本章最重要場面生成AI圖像）
+
+⚠️ 每章結尾「必須」包含以上選項格式，絕對不要省略！
 
 然後在章節結束後，輸出一個 JSON Story Bible（用 ```json 包起來），包含：
 {{
@@ -125,7 +134,19 @@ I) [生成本篇圖像]
 之前章節選擇記錄：
 {history}
 
-請嚴格維持 Story Bible 中定義的風格，生成第 {chapter_num} 章（繁體中文），並在章節後更新 Story Bible（JSON）。格式必須完全符合技能文件規定。"""
+請嚴格維持 Story Bible 中定義的風格，生成第 {chapter_num} 章（繁體中文），並在章節後更新 Story Bible（JSON）。
+
+⚠️ 重要：每章結尾「必須」包含以下格式的選項，否則用戶無法繼續：
+
+**你接下來要怎麼做？**
+A) [選項A — 簡短誘人描述]
+B) [選項B — 會帶來不同走向]
+C) [選項C]
+D) [選項D]
+E) [選項E — 可選]
+I) [生成本篇圖像] （為本章最重要場面生成AI圖像）
+
+絕對不要省略選項部分！格式必須完全符合技能文件規定。"""
 
     try:
         response = client.chat.completions.create(
@@ -176,8 +197,12 @@ I) [生成本篇圖像]
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 歡迎來到 sleyStory！\n\n"
-        "我可以為你生成繁體中文長篇互動故事。\n"
-        "輸入 /newstory + 故事描述 開始一個新故事（例如：/newstory 我要講香港現代懸疑故事）"
+        "我可以為你生成繁體中文長篇互動故事。\n\n"
+        "指令：\n"
+        "• /newstory + 描述 → 建立新故事\n"
+        "• /mystories → 查看你所有的故事\n"
+        "• /loadstory <ID> → 載入指定故事繼續玩\n\n"
+        "例如：/newstory 我要講香港現代懸疑故事"
     )
 
 async def new_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -196,7 +221,64 @@ async def new_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["initial_prompt"] = prompt
 
     chapter1, _ = generate_chapter(story_id, initial_prompt=prompt, is_first=True)
-    await update.message.reply_text(chapter1)
+
+    await update.message.reply_text(
+        f"✅ 新故事已建立！Story ID: `{story_id}`\n"
+        f"以後可以用 `/loadstory {story_id}` 繼續這個故事。\n\n"
+        f"{chapter1}"
+    )
+
+
+async def list_my_stories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT story_id, title, current_chapter, created_at 
+                 FROM stories WHERE user_id = ? ORDER BY story_id DESC""", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("你目前沒有任何故事。請用 /newstory 開始一個新故事！")
+        return
+
+    msg = "📚 你的故事列表：\n\n"
+    for row in rows:
+        sid, title, ch, created = row
+        msg += f"• ID `{sid}` — {title}（第 {ch} 章）\n  建立於 {created[:10]}\n"
+    msg += "\n使用 `/loadstory <ID>` 繼續某個故事。"
+    await update.message.reply_text(msg)
+
+
+async def load_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args
+    if not args:
+        await update.message.reply_text("請輸入 Story ID，例如：`/loadstory 5`")
+        return
+
+    try:
+        story_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Story ID 必須是數字，例如：`/loadstory 5`")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT story_id FROM stories WHERE story_id = ? AND user_id = ?", (story_id, user_id))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        await update.message.reply_text(f"找不到 Story ID `{story_id}`，或這不是你的故事。")
+        return
+
+    context.user_data["current_story_id"] = story_id
+    await update.message.reply_text(
+        f"✅ 已載入 Story ID `{story_id}`！\n"
+        f"現在可以直接輸入 A / B / C / D / E / I 繼續故事。"
+    )
+
 
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -213,10 +295,15 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("newstory", new_story))
+    app.add_handler(CommandHandler("mystories", list_my_stories))
+    app.add_handler(CommandHandler("loadstory", load_story))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice))
 
     print("📖 sleyStory bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
+    if sys.platform == "darwin":
+        # Fix for Python 3.12+ on macOS: ensure an event loop exists
+        asyncio.set_event_loop(asyncio.new_event_loop())
     main()
