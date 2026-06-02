@@ -693,14 +693,28 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int) ->
 
 
 async def generate_image_for_chapter(chapter_content: str, story_id: int, chapter_num: int) -> str:
-    """Generate an image for the chapter based on IMAGE_MODE."""
+    """
+    Generate image for the chapter.
+    - If IMAGE_MODE == "comfyui": try to call local ComfyUI.
+    - Otherwise / on failure: return a high-quality prompt for the user to use manually.
+    """
     prompt = await create_image_prompt(chapter_content)
 
     if IMAGE_MODE == "comfyui":
-        return await generate_with_comfyui(prompt, story_id, chapter_num)
+        # Try real ComfyUI generation
+        try:
+            image_path = await generate_with_comfyui(prompt, story_id, chapter_num)
+            if image_path:
+                return image_path
+        except Exception as e:
+            logger.error(f"ComfyUI generation error: {e}")
+
+        # If ComfyUI fails, fall back to giving the user the prompt
+        return f"【圖像生成失敗】\nComfyUI 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
+
     else:
-        logger.info("[Grok Imagine] Not available via public API yet.")
-        return None
+        # Not using ComfyUI → just give the prompt
+        return f"【圖像 Prompt】\n（目前使用手動生成模式）\n\n{prompt}\n\n請複製以上 prompt 到 ComfyUI / Flux / Grok Imagine 等工具生成圖片。"
 
 
 async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -728,7 +742,10 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     story_id = context.user_data.get("current_story_id")
 
     if not story_id:
-        await update.message.reply_text("請先用 /newstory 開始一個新故事。")
+        await update.message.reply_text(
+            "你的對話 session 已過期或尚未載入故事。\n"
+            "請使用 `/loadstory <ID>` 重新載入你的故事（例如：`/loadstory 8`）。"
+        )
         return
 
     # Resolve single-letter choice (A/B/C/D/E/I) to full choice text
@@ -743,13 +760,19 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Parse and store new choices for next turn
     context.user_data["last_choices"] = parse_choices(chapter_text)
 
-    # Handle "I" option for image generation
-    if resolved_choice.upper().startswith("I)"):
-        image_path = await generate_image_for_chapter(chapter_text, story_id, ch_num)
-        if image_path and os.path.exists(image_path):
+    # Handle "I" option for image generation (support both "I" and "I)")
+    choice_upper = resolved_choice.upper()
+    if choice_upper.startswith("I") or choice_upper == "I":
+        result = await generate_image_for_chapter(chapter_text, story_id, ch_num)
+
+        if result and result.startswith("【"):
+            # This is a prompt or error message, not an image path
+            await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n{result}")
+        elif result and os.path.exists(result):
+            # Real image file
             try:
                 await update.message.reply_photo(
-                    photo=open(image_path, "rb"),
+                    photo=open(result, "rb"),
                     caption=f"（第 {ch_num} 章）\n\n{chapter_text[:800]}..."
                 )
             except Exception as e:
