@@ -755,33 +755,40 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         resolved_choice = text
 
-    chapter_text, ch_num = generate_chapter(story_id, user_choice=resolved_choice)
-
-    # Parse and store new choices for next turn
-    context.user_data["last_choices"] = parse_choices(chapter_text)
-
-    # Handle "I" option for image generation (support both "I" and "I)")
     choice_upper = resolved_choice.upper()
-    if choice_upper.startswith("I") or choice_upper == "I":
-        result = await generate_image_for_chapter(chapter_text, story_id, ch_num)
 
-        if result and result.startswith("【"):
-            # This is a prompt or error message, not an image path
-            await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n{result}")
-        elif result and os.path.exists(result):
-            # Real image file
+    # Handle "I" option first (image generation)
+    if choice_upper.startswith("I") or choice_upper == "I":
+        # First, try to generate the image (without generating the chapter yet)
+        # We pass a placeholder to get the prompt / result
+        temp_result = await generate_image_for_chapter("", story_id, 0)
+
+        if temp_result and not temp_result.startswith("【"):
+            # Image can be generated → now generate the chapter normally
+            chapter_text, ch_num = generate_chapter(story_id, user_choice=resolved_choice)
+            context.user_data["last_choices"] = parse_choices(chapter_text)
+
             try:
                 await update.message.reply_photo(
-                    photo=open(result, "rb"),
+                    photo=open(temp_result, "rb"),
                     caption=f"（第 {ch_num} 章）\n\n{chapter_text[:800]}..."
                 )
             except Exception as e:
                 logger.error(f"Failed to send image: {e}")
                 await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n（圖像發送失敗）")
         else:
-            await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n（圖像生成暫時無法使用）")
-    else:
-        await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}")
+            # Image generation not available → ask user to choose a normal option
+            await update.message.reply_text(
+                "圖像無法生成。\n"
+                "請重新選擇其他選項（A / B / C / D / E）。"
+            )
+        return
+
+    # Normal story choice (A/B/C/D/E)
+    chapter_text, ch_num = generate_chapter(story_id, user_choice=resolved_choice)
+    context.user_data["last_choices"] = parse_choices(chapter_text)
+
+    await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
