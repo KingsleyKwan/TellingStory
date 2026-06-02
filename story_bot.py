@@ -199,19 +199,19 @@ def parse_choices(chapter_text: str) -> dict:
 
 # ====================== HYBRID GENERATION (Grok + Local Guardrail) ======================
 
-GROK_SYSTEM_PROMPT = """【最高優先級規則 - 角色一致性 + 輸出格式】
+GROK_SYSTEM_PROMPT = """【最高優先級規則 - 角色一致性 + 用戶選擇強制遵循 + 輸出格式】
 你係 sleyStory 嘅故事生成器。生成任何內容前必須嚴格遵守以下規則：
 
 1. 所有角色必須 100% 符合 database 所儲存嘅角色資料。
 2. 所有角色之間嘅互動必須符合 character_relationships 表嘅關係設定。
-3. 如果你生成嘅內容違反以上任何一點，會被本地 Guardrail 拒絕並要求修改。
+3. 【最重要】你必須嚴格根據用戶本次選擇的行動來發展劇情，絕對不能偏離或忽略用戶的選擇。
 
 【嚴格輸出格式要求】
 你必須把輸出分成「給用戶看的故事」和「給程式用的隱藏資料」兩部分，格式如下：
 
 **第 X 章：【章節標題】**
 
-[沉浸式自然敘事 + 對話，絕對不要出現任何技術性詞彙，例如 short_term_goal、trust_level、MBTI、current_state、relationship_type 等。故事要像真正的輕小說一樣自然流暢。]
+[沉浸式自然敘事 + 對話，絕對不要出現任何技術性詞彙。故事要像真正的輕小說一樣自然流暢。]
 
 **你接下來要怎麼做？**
 A) ...
@@ -221,29 +221,7 @@ I) ...
 ---
 DATA
 ```json
-{
-  "updated_characters": {
-    "角色名": {
-      "short_term_goal": "...",
-      "mid_term_goal": "...",
-      "long_term_goal": "...",
-      "personality": "...",
-      "mbti": "...",
-      "current_state": "..."
-    }
-  },
-  "updated_relationships": [
-    {
-      "character_a": "角色A",
-      "character_b": "角色B",
-      "relationship_type": "...",
-      "trust_level": 65,
-      "affection_level": 40,
-      "tension_level": 10,
-      "relationship_summary": "..."
-    }
-  ]
-}
+{...}
 ```
 
 ⚠️ 故事本文絕對不要提到任何資料庫欄位或技術詞彙！
@@ -288,14 +266,14 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
 {ctx['story_bible']}
 
 這是故事的第 {chapter_num} 章。
-用戶選擇：{user_choice}
+【用戶本次選擇】：{user_choice}
 
 之前章節選擇記錄：
 {history}
 {char_context}
 {rel_context}
 
-請嚴格遵守角色一致性規則，生成第 {chapter_num} 章（繁體中文）。
+請嚴格遵守角色一致性規則，並**必須以用戶本次選擇為核心**來發展劇情。
 輸出格式必須嚴格按照 system prompt 的要求：故事本文（乾淨自然） + ---DATA + JSON。
 絕對不要在故事本文中出現任何技術性詞彙。"""
 
