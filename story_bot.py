@@ -199,23 +199,31 @@ def parse_choices(chapter_text: str) -> dict:
 
 # ====================== HYBRID GENERATION (Grok + Local Guardrail) ======================
 
-GROK_SYSTEM_PROMPT = """【最高優先級規則 - 角色一致性】
+GROK_SYSTEM_PROMPT = """【最高優先級規則 - 角色一致性 + 用戶選擇強制遵循 + 輸出格式】
 你係 sleyStory 嘅故事生成器。生成任何內容前必須嚴格遵守以下規則：
 
-1. 所有角色必須 100% 符合 database 所儲存嘅：
-   - 性格、MBTI、目標（短期/中期/長期）、能力、外型、持有物品、current_state
-2. 所有角色之間嘅互動必須符合 character_relationships 表嘅：
-   - relationship_type、trust_level、affection_level、歷史摘要
-3. 如果你生成嘅內容違反以上任何一點，會被本地 Guardrail 拒絕並要求修改。
+1. 所有角色必須 100% 符合 database 所儲存嘅角色資料。
+2. 所有角色之間嘅互動必須符合 character_relationships 表嘅關係設定。
+3. 【最重要】你必須嚴格根據用戶本次選擇的行動來發展劇情，絕對不能偏離或忽略用戶的選擇。
 
-請用極致細膩嘅繁體中文描寫，並確保角色行動、對話、內心完全一致。
-你必須維持故事的原始風格、角色性格、世界觀與氛圍，直到第20章都不改變。
-每次產生 800-1800 字的詳細章節，包含大量對話、關係發展、真實後果。
-⚠️ 每章結尾「必須」包含 A/B/C/D/E/I 選項，絕對不要省略！
-⚠️ 絕對不要在章節開頭輸出任何 meta 說明，直接從章節標題開始。
+【嚴格輸出格式要求】
+你必須把輸出分成「給用戶看的故事」和「給程式用的隱藏資料」兩部分，格式如下：
 
-【JSON Story Bible 格式要求】
-每章結束時，請在 ```json 區塊輸出以下結構（盡量使用此格式）：
+**第 X 章：【章節標題】**
+
+[沉浸式繁體中文敘事，800-1800字，包含大量自然對話、表情、動作、心理描寫。絕對不要出現任何技術性詞彙（例如 short_term_goal、trust_level、MBTI、current_state、relationship_type 等）。故事要像真正的輕小說一樣自然流暢。]
+
+**你接下來要怎麼做？**
+A) [選項A — 簡短誘人描述]
+B) [選項B — 會帶來不同走向]
+C) [選項C]
+D) [選項D]
+E) [選項E — 可選]
+I) [生成本篇圖像] （為本章最重要場面生成AI圖像）
+
+---
+DATA
+```json
 {
   "updated_characters": {
     "角色名": {
@@ -231,14 +239,19 @@ GROK_SYSTEM_PROMPT = """【最高優先級規則 - 角色一致性】
     {
       "character_a": "角色A",
       "character_b": "角色B",
-      "relationship_type": "朋友/情侶/敵人...",
+      "relationship_type": "...",
       "trust_level": 65,
       "affection_level": 40,
       "tension_level": 10,
       "relationship_summary": "..."
     }
   ]
-}"""
+}
+```
+
+⚠️ 故事本文絕對不要提到任何資料庫欄位或技術詞彙！
+⚠️ 每章結尾「必須」包含 A/B/C/D/E/I 選項。
+⚠️ 絕對不要在章節開頭輸出任何 meta 說明，直接從章節標題開始。"""
 
 
 def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str = "", is_first: bool = False) -> tuple:
@@ -270,20 +283,24 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
 
     if is_first:
         user_msg = f"""用戶想要的故事主題與風格：{initial_prompt or '未指定'}
-請生成第 1 章（繁體中文），嚴格遵守角色一致性規則。格式必須包含章節標題 + 敘事 + A/B/C/D/E/I 選項 + ```json Story Bible（使用 updated_characters + updated_relationships 格式）。"""
+請生成第 1 章（繁體中文），嚴格遵守角色一致性規則。
+輸出格式必須嚴格按照 system prompt 的要求：故事本文（乾淨自然） + ---DATA + JSON。
+絕對不要在故事本文中出現任何技術性詞彙。"""
     else:
         user_msg = f"""目前 Story Bible：
 {ctx['story_bible']}
 
 這是故事的第 {chapter_num} 章。
-用戶選擇：{user_choice}
+【用戶本次選擇】：{user_choice}
 
 之前章節選擇記錄：
 {history}
 {char_context}
 {rel_context}
 
-請嚴格遵守角色一致性規則，生成第 {chapter_num} 章（繁體中文），並更新 Story Bible（JSON，使用 updated_characters + updated_relationships 格式）。"""
+請嚴格遵守角色一致性規則，並**必須以用戶本次選擇為核心**來發展劇情。
+輸出格式必須嚴格按照 system prompt 的要求：故事本文（乾淨自然） + ---DATA + JSON。
+絕對不要在故事本文中出現任何技術性詞彙。"""
 
     if not grok_client:
         return "錯誤：未設定 GROK_API_KEY，無法使用 Grok 生成故事。", chapter_num
@@ -329,19 +346,32 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
             )
             full_output = response.choices[0].message.content.strip()
 
-        # Parse chapter + bible
+        # ====================== NEW SEPARATED OUTPUT PARSING ======================
         chapter_content = full_output
-        new_bible = None
         parsed_json = None
-        if "```json" in full_output:
-            parts = full_output.split("```json")
-            chapter_content = parts[0].strip()
-            try:
-                json_str = re.search(r'\{.*\}', parts[1], re.DOTALL).group(0)
-                new_bible = json_str
-                parsed_json = json.loads(json_str)
-            except Exception as e:
-                logger.warning(f"Failed to parse Story Bible JSON: {e}")
+
+        # Split story and hidden data using the new delimiter
+        if "---\nDATA" in full_output:
+            story_part, data_part = full_output.split("---\nDATA", 1)
+            chapter_content = story_part.strip()
+
+            # Extract JSON from the DATA section
+            if "```json" in data_part:
+                try:
+                    json_str = re.search(r'\{.*\}', data_part.split("```json")[1], re.DOTALL).group(0)
+                    parsed_json = json.loads(json_str)
+                except Exception as e:
+                    logger.warning(f"Failed to parse hidden DATA JSON: {e}")
+        else:
+            # Fallback: old format (try to extract any JSON)
+            if "```json" in full_output:
+                try:
+                    parts = full_output.split("```json")
+                    chapter_content = parts[0].strip()
+                    json_str = re.search(r'\{.*\}', parts[1], re.DOTALL).group(0)
+                    parsed_json = json.loads(json_str)
+                except:
+                    pass
 
         # Save to DB
         conn = sqlite3.connect(DB_PATH)
