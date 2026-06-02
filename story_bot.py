@@ -349,6 +349,7 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
         # ====================== NEW SEPARATED OUTPUT PARSING ======================
         chapter_content = full_output
         parsed_json = None
+        new_bible = None
 
         # Split story and hidden data using the new delimiter
         if "---\nDATA" in full_output:
@@ -622,21 +623,83 @@ async def load_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ====================== IMAGE GENERATION ======================
 
+async def create_image_prompt(chapter_content: str) -> str:
+    """Create a high-quality English prompt for image generation from chapter content."""
+    # Extract key visual elements
+    scene = chapter_content[:600].replace('\n', ' ').strip()
+
+    prompt = (
+        f"cinematic scene from a light novel, {scene}, "
+        "highly detailed, beautiful lighting, expressive character faces, "
+        "atmospheric, fantasy adventure style, sharp focus, 8k --ar 16:9 --stylize 250"
+    )
+    return prompt
+
+
+async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int) -> str:
+    """Generate image using local ComfyUI."""
+    import aiohttp
+    import os
+    from pathlib import Path
+
+    output_dir = Path("generated_images")
+    output_dir.mkdir(exist_ok=True)
+
+    # Minimal ComfyUI workflow (text-to-image)
+    # This assumes the user has a basic txt2img workflow with node IDs 1-8
+    workflow = {
+        "1": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["4", 1], "text": prompt}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["4", 1], "text": "low quality, blurry"}},
+        "3": {"class_type": "KSampler", "inputs": {
+            "seed": 123456, "steps": 20, "cfg": 7.5, "sampler_name": "euler",
+            "scheduler": "normal", "denoise": 1.0,
+            "model": ["4", 0], "positive": ["1", 0], "negative": ["2", 0],
+            "latent_image": ["5", 0]
+        }},
+        "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 576, "batch_size": 1}},
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["4", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": f"story_{story_id}_ch{chapter_num}", "images": ["6", 0]}}
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow}) as resp:
+                if resp.status != 200:
+                    logger.error(f"ComfyUI returned status {resp.status}")
+                    return None
+
+                result = await resp.json()
+                prompt_id = result.get("prompt_id")
+
+                # Wait for completion (simple polling)
+                for _ in range(30):
+                    await asyncio.sleep(2)
+                    async with session.get(f"{COMFYUI_URL}/history/{prompt_id}") as hist_resp:
+                        history = await hist_resp.json()
+                        if prompt_id in history:
+                            outputs = history[prompt_id].get("outputs", {})
+                            for node_id, node_output in outputs.items():
+                                if "images" in node_output:
+                                    filename = node_output["images"][0]["filename"]
+                                    image_path = output_dir / filename
+                                    logger.info(f"Image saved: {image_path}")
+                                    return str(image_path)
+    except Exception as e:
+        logger.error(f"ComfyUI generation failed: {e}")
+        return None
+
+    return None
+
+
 async def generate_image_for_chapter(chapter_content: str, story_id: int, chapter_num: int) -> str:
     """Generate an image for the chapter based on IMAGE_MODE."""
-    prompt = f"電影感構圖，繁體中文故事場景：{chapter_content[:400]}... 高質素、細膩光影、角色表情豐富"
+    prompt = await create_image_prompt(chapter_content)
 
     if IMAGE_MODE == "comfyui":
-        try:
-            # Placeholder for real ComfyUI workflow trigger
-            logger.info(f"[ComfyUI] Would generate image for story {story_id} chapter {chapter_num}")
-            return f"[ComfyUI] 圖像已生成（開發中） - {chapter_num}.png"
-        except Exception as e:
-            logger.error(f"ComfyUI error: {e}")
-            return None
+        return await generate_with_comfyui(prompt, story_id, chapter_num)
     else:
-        # Grok Imagine (currently not available via public API)
-        logger.info(f"[Grok Imagine] Image generation requested but not yet available via API.")
+        logger.info("[Grok Imagine] Not available via public API yet.")
         return None
 
 
@@ -682,9 +745,16 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Handle "I" option for image generation
     if resolved_choice.upper().startswith("I)"):
-        image_result = await generate_image_for_chapter(chapter_text, story_id, ch_num)
-        if image_result:
-            await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n🖼️ {image_result}")
+        image_path = await generate_image_for_chapter(chapter_text, story_id, ch_num)
+        if image_path and os.path.exists(image_path):
+            try:
+                await update.message.reply_photo(
+                    photo=open(image_path, "rb"),
+                    caption=f"（第 {ch_num} 章）\n\n{chapter_text[:800]}..."
+                )
+            except Exception as e:
+                logger.error(f"Failed to send image: {e}")
+                await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n（圖像發送失敗）")
         else:
             await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n（圖像生成暫時無法使用）")
     else:
