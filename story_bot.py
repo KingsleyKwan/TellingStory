@@ -349,6 +349,7 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
         # ====================== NEW SEPARATED OUTPUT PARSING ======================
         chapter_content = full_output
         parsed_json = None
+        new_bible = None
 
         # Split story and hidden data using the new delimiter
         if "---\nDATA" in full_output:
