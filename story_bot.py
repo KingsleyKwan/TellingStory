@@ -728,7 +728,10 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     story_id = context.user_data.get("current_story_id")
 
     if not story_id:
-        await update.message.reply_text("請先用 /newstory 開始一個新故事。")
+        await update.message.reply_text(
+            "你的對話 session 已過期或尚未載入故事。\n"
+            "請使用 `/loadstory <ID>` 重新載入你的故事（例如：`/loadstory 8`）。"
+        )
         return
 
     # Resolve single-letter choice (A/B/C/D/E/I) to full choice text
@@ -743,8 +746,9 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Parse and store new choices for next turn
     context.user_data["last_choices"] = parse_choices(chapter_text)
 
-    # Handle "I" option for image generation
-    if resolved_choice.upper().startswith("I)"):
+    # Handle "I" option for image generation (support both "I" and "I)")
+    choice_upper = resolved_choice.upper()
+    if choice_upper.startswith("I") or choice_upper == "I":
         image_path = await generate_image_for_chapter(chapter_text, story_id, ch_num)
         if image_path and os.path.exists(image_path):
             try:
