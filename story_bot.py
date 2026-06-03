@@ -258,12 +258,37 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
     """
     Hybrid generation:
     1. Load context (characters, relationships, bible, recent chapters)
-    2. Call Grok for creative generation
-    3. Run local guardrail (up to 2 retries)
-    4. Save everything
+    2. Pre-check for obvious character state conflicts (prevent invalid choices)
+    3. Call Grok for creative generation
+    4. Run local guardrail (up to 2 retries)
+    5. Save everything
     """
     ctx = load_story_context(story_id)
     chapter_num = ctx["current_chapter"] + (0 if is_first else 1)
+
+    # === B: Pre-check for character state conflicts ===
+    if user_choice and ctx.get("characters"):
+        choice_lower = user_choice.lower()
+        characters = ctx.get("characters", {})
+
+        # Check for common conflict patterns (e.g., trying to interact with imprisoned characters as if they are free)
+        imprisoned_keywords = ["hana", "yuki", "囚禁", "哥布林", "巢穴", "救出", "救援"]
+        conflicting_actions = ["一起", "聊天", "吃早餐", "組隊", "一起去", "一起行動", "已經救", "直接救"]
+
+        for name, data in characters.items():
+            current_state = (data.get("current_state") or "").lower()
+            if any(kw in current_state for kw in imprisoned_keywords):
+                # This character is currently imprisoned
+                if any(action in choice_lower for action in conflicting_actions):
+                    warning = (
+                        f"⚠️ 角色狀態衝突警告！\n\n"
+                        f"根據資料庫記錄，角色「{name}」目前狀態為：\n"
+                        f"「{data.get('current_state')}」\n\n"
+                        f"你本次選擇「{user_choice}」似乎假設該角色已經自由行動，這與 Story Bible 衝突。\n\n"
+                        f"請先使用 /bug 修正故事狀態，或選擇其他不會違反角色當前狀態的選項。"
+                    )
+                    logger.warning(f"Blocked conflicting choice for story {story_id}: {user_choice}")
+                    return warning, chapter_num
 
     # Build rich context for Grok
     char_context = ""
@@ -739,15 +764,27 @@ async def test_guardrail(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allow user to report a story inconsistency. System verifies with Grok and auto-replaces the previous chapter if a valid correction is provided."""
+    """Allow user to report a story inconsistency. Supports targeting specific chapters (e.g. /bug 63 Yuki和Hana應該仍然被哥布林囚禁)."""
     story_id = context.user_data.get("current_story_id")
     if not story_id:
         await update.message.reply_text("請先載入一個故事（/loadstory <ID>）才能回報 bug。")
         return
 
-    bug_description = update.message.text.replace("/bug", "").strip()
+    args = update.message.text.replace("/bug", "").strip().split(maxsplit=1)
+    if not args or not args[0]:
+        await update.message.reply_text("請在 /bug 後面描述衝突的內容，例如：\n`/bug Yuki還在哥布林那兒，不可能出現在村莊`\n或指定章節：`/bug 63 Yuki和Hana應該仍然被哥布林囚禁`")
+        return
+
+    # Support optional chapter number: /bug 63 <description>
+    target_chapter = None
+    if args[0].isdigit():
+        target_chapter = int(args[0])
+        bug_description = args[1] if len(args) > 1 else ""
+    else:
+        bug_description = " ".join(args)
+
     if not bug_description:
-        await update.message.reply_text("請在 /bug 後面描述衝突的內容，例如：\n`/bug Yuki還在哥布林那兒，不可能出現在村莊`")
+        await update.message.reply_text("請提供衝突描述，例如：`/bug 63 Yuki和Hana應該仍然被哥布林囚禁`")
         return
 
     ctx = load_story_context(story_id)
@@ -755,29 +792,38 @@ async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("目前只有第 1 章，無法回報 bug。")
         return
 
-    # Load the previous chapter
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""SELECT chapter_num, content FROM chapters 
-                 WHERE story_id = ? ORDER BY chapter_num DESC LIMIT 2""", (story_id,))
-    rows = c.fetchall()
-    conn.close()
+    # Determine which chapter to load and correct
+    if target_chapter:
+        # User specified a chapter number
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""SELECT chapter_num, content FROM chapters 
+                     WHERE story_id = ? AND chapter_num = ?""", (story_id, target_chapter))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            await update.message.reply_text(f"找不到第 {target_chapter} 章。")
+            return
+        target_chapter_num, target_content = row
+    else:
+        # Default: correct the previous chapter
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""SELECT chapter_num, content FROM chapters 
+                     WHERE story_id = ? ORDER BY chapter_num DESC LIMIT 2""", (story_id,))
+        rows = c.fetchall()
+        conn.close()
+        if len(rows) < 2:
+            await update.message.reply_text("找不到足夠的章節記錄，無法進行修正。")
+            return
+        target_chapter_num, target_content = rows[1]
 
-    if len(rows) < 2:
-        await update.message.reply_text("找不到足夠的章節記錄，無法進行修正。")
-        return
-
-    prev_chapter_num, prev_content = rows[1]
-    latest_chapter_num, _ = rows[0]
-
-    logger.info(f"User reported bug on story {story_id}, chapter {prev_chapter_num}: {bug_description[:80]}...")
-    logger.info(f"Relevant character context for bug judgment: {list(relevant_chars.keys()) if relevant_chars else 'none'}")
+    logger.info(f"User reported bug on story {story_id}, chapter {target_chapter_num}: {bug_description[:80]}...")
 
     # Build authoritative context from Story Bible + character states
     story_bible = ctx.get("story_bible", "{}")
     characters = ctx.get("characters", {})
 
-    # Extract relevant character states (especially the ones mentioned in the bug)
     relevant_chars = {}
     bug_lower = bug_description.lower()
     for name, data in characters.items():
@@ -792,12 +838,11 @@ async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if relevant_chars:
         char_context = "\n【角色當前狀態（Story Bible 權威來源）】\n" + json.dumps(relevant_chars, ensure_ascii=False, indent=2)
 
-    # Improved prompt with Story Bible context
     analysis_prompt = f"""用戶回報故事出現內容衝突：
 【用戶回報】：{bug_description}
 
-以下是前一章（第 {prev_chapter_num} 章）的完整內容：
-{prev_content}
+以下是目標章節（第 {target_chapter_num} 章）的完整內容：
+{target_content}
 
 {char_context}
 
@@ -806,7 +851,7 @@ async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 【嚴格指令】
 1. 請**根據 Story Bible 和角色 current_state** 來判斷此回報是否屬實。
-2. **如果屬實**，你「必須」輸出**完整修正後的第 {prev_chapter_num} 章**，格式完全遵循原本章節的輸出格式：
+2. **如果屬實**，你「必須」輸出**完整修正後的第 {target_chapter_num} 章**，格式完全遵循原本章節的輸出格式：
    - 以 **第 X 章：【標題】** 開頭
    - 故事本文（繁體中文，包含對話與細節）
    - **你接下來要怎麼做？** + A/B/C/D/E/I 選項
@@ -874,15 +919,15 @@ async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c = conn.cursor()
             c.execute("""UPDATE chapters SET content = ? 
                          WHERE story_id = ? AND chapter_num = ?""",
-                      (corrected_content, story_id, prev_chapter_num))
+                      (corrected_content, story_id, target_chapter_num))
             conn.commit()
             conn.close()
 
             context.user_data["last_choices"] = parse_choices(corrected_content)
-            logger.info(f"Successfully replaced chapter {prev_chapter_num} with corrected version for story {story_id}")
+            logger.info(f"Successfully replaced chapter {target_chapter_num} with corrected version for story {story_id}")
 
             await update.message.reply_text(
-                f"✅ 已自動修正第 {prev_chapter_num} 章！\n\n"
+                f"✅ 已自動修正第 {target_chapter_num} 章！\n\n"
                 f"以下是修正後的內容：\n\n{corrected_content}\n\n"
                 f"請繼續選擇下一步（A/B/C/D/E/I）。"
             )
