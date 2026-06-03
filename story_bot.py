@@ -538,7 +538,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "指令：\n"
         "• /newstory + 描述 → 建立新故事\n"
         "• /mystories → 查看你所有的故事\n"
-        "• /loadstory <ID> → 載入指定故事繼續玩\n\n"
+        "• /loadstory <ID> → 載入指定故事繼續玩\n"
+        "• /bug <衝突描述> → 回報故事內容衝突，系統會審查並修正前一章\n\n"
         "例如：/newstory 我要講香港現代懸疑故事"
     )
 
@@ -737,6 +738,121 @@ async def test_guardrail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Guardrail 測試結果：\n{json.dumps(result, ensure_ascii=False, indent=2)}")
 
 
+async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow user to report a story inconsistency. System will verify and regenerate the previous chapter if confirmed."""
+    story_id = context.user_data.get("current_story_id")
+    if not story_id:
+        await update.message.reply_text("請先載入一個故事（/loadstory <ID>）才能回報 bug。")
+        return
+
+    bug_description = update.message.text.replace("/bug", "").strip()
+    if not bug_description:
+        await update.message.reply_text("請在 /bug 後面描述衝突的內容，例如：\n`/bug Yuki還在哥布林那兒，不可能出現在村莊`")
+        return
+
+    ctx = load_story_context(story_id)
+    if ctx["current_chapter"] <= 1:
+        await update.message.reply_text("目前只有第 1 章，無法回報 bug。")
+        return
+
+    # Load the previous chapter (the one user wants to correct)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT chapter_num, content FROM chapters 
+                 WHERE story_id = ? ORDER BY chapter_num DESC LIMIT 2""", (story_id,))
+    rows = c.fetchall()
+    conn.close()
+
+    if len(rows) < 2:
+        await update.message.reply_text("找不到足夠的章節記錄，無法進行修正。")
+        return
+
+    prev_chapter_num, prev_content = rows[1]  # second last = previous chapter
+    latest_chapter_num, _ = rows[0]
+
+    # Ask Grok to analyze and fix
+    analysis_prompt = f"""用戶回報故事出現內容衝突：
+【用戶回報】：{bug_description}
+
+以下是前一章（第 {prev_chapter_num} 章）的完整內容：
+{prev_content}
+
+請嚴格審查：
+1. 這個回報是否屬實？（故事中是否真的出現了與先前設定衝突的情節？）
+2. 如果屬實，請提供**修正後的第 {prev_chapter_num} 章完整內容**，必須：
+   - 保留原有風格與長度
+   - 修正衝突的部分
+   - 輸出格式與原本完全相同（故事本文 + 選項 + ---DATA + JSON）
+   - 不要改變章節標題格式
+
+如果這個回報不屬實，請直接回答：「此回報不成立，故事內容並無此衝突。」"""
+
+    if not grok_client:
+        await update.message.reply_text("錯誤：未設定 GROK_API_KEY，無法進行 bug 審查。")
+        return
+
+    try:
+        response = grok_client.chat.completions.create(
+            model=GROK_MODEL,
+            messages=[
+                {"role": "system", "content": "你是一個嚴謹的故事一致性審查員。"},
+                {"role": "user", "content": analysis_prompt}
+            ],
+            temperature=0.6,
+            max_tokens=4000
+        )
+        analysis_result = response.choices[0].message.content.strip()
+
+        # Record the bug report
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO memories (story_id, memory_type, key, value, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (story_id, "bug_report", f"chapter_{prev_chapter_num}", 
+              json.dumps({"bug": bug_description, "result": analysis_result[:500]}, ensure_ascii=False),
+              datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+
+        if "此回報不成立" in analysis_result or "不屬實" in analysis_result:
+            await update.message.reply_text(
+                f"審查結果：此回報不成立。\n\n{analysis_result}\n\n故事內容維持原狀。"
+            )
+            return
+
+        # If Grok provided a corrected chapter, try to extract and replace
+        if "---\nDATA" in analysis_result or "```json" in analysis_result:
+            # Parse corrected chapter (reuse existing parsing logic conceptually)
+            corrected_content = analysis_result.split("---\nDATA")[0].strip() if "---\nDATA" in analysis_result else analysis_result
+
+            # Replace the previous chapter content
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("""UPDATE chapters SET content = ? 
+                         WHERE story_id = ? AND chapter_num = ?""",
+                      (corrected_content, story_id, prev_chapter_num))
+            conn.commit()
+            conn.close()
+
+            # Update user session so they continue from the corrected chapter
+            context.user_data["last_choices"] = parse_choices(corrected_content)
+
+            await update.message.reply_text(
+                f"✅ 已修正第 {prev_chapter_num} 章！\n\n"
+                f"以下是修正後的內容：\n\n{corrected_content}\n\n"
+                f"請繼續選擇下一步（A/B/C/D/E/I）。"
+            )
+        else:
+            await update.message.reply_text(
+                f"審查完成，但 Grok 未提供修正版本。\n\n{analysis_result}"
+            )
+
+    except Exception as e:
+        logger.error(f"Bug report handling error: {e}")
+        await update.message.reply_text(f"處理 bug 回報時發生錯誤：{e}")
+
+
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     story_id = context.user_data.get("current_story_id")
@@ -798,6 +914,7 @@ def main():
     app.add_handler(CommandHandler("loadstory", load_story))
     app.add_handler(CommandHandler("image_mode", set_image_mode))
     app.add_handler(CommandHandler("test_guardrail", test_guardrail))
+    app.add_handler(CommandHandler("bug", handle_bug_report))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice))
 
     print("📖 sleyStory bot is running... (Hybrid Grok + Local Guardrail mode)")
