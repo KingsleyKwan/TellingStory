@@ -771,16 +771,41 @@ async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     latest_chapter_num, _ = rows[0]
 
     logger.info(f"User reported bug on story {story_id}, chapter {prev_chapter_num}: {bug_description[:80]}...")
+    logger.info(f"Relevant character context for bug judgment: {list(relevant_chars.keys()) if relevant_chars else 'none'}")
 
-    # Improved prompt - stronger instruction for consistent output format
+    # Build authoritative context from Story Bible + character states
+    story_bible = ctx.get("story_bible", "{}")
+    characters = ctx.get("characters", {})
+
+    # Extract relevant character states (especially the ones mentioned in the bug)
+    relevant_chars = {}
+    bug_lower = bug_description.lower()
+    for name, data in characters.items():
+        if any(kw in bug_lower for kw in [name.lower(), "hana", "yuki", "囚禁", "哥布林", "imprison"]):
+            relevant_chars[name] = {
+                "current_state": data.get("current_state"),
+                "short_term_goal": data.get("short_term_goal"),
+                "long_term_goal": data.get("long_term_goal")
+            }
+
+    char_context = ""
+    if relevant_chars:
+        char_context = "\n【角色當前狀態（Story Bible 權威來源）】\n" + json.dumps(relevant_chars, ensure_ascii=False, indent=2)
+
+    # Improved prompt with Story Bible context
     analysis_prompt = f"""用戶回報故事出現內容衝突：
 【用戶回報】：{bug_description}
 
 以下是前一章（第 {prev_chapter_num} 章）的完整內容：
 {prev_content}
 
+{char_context}
+
+【Story Bible 摘要】
+{story_bible[:1500] if len(story_bible) > 1500 else story_bible}
+
 【嚴格指令】
-1. 先判斷此回報是否屬實。
+1. 請**根據 Story Bible 和角色 current_state** 來判斷此回報是否屬實。
 2. **如果屬實**，你「必須」輸出**完整修正後的第 {prev_chapter_num} 章**，格式完全遵循原本章節的輸出格式：
    - 以 **第 X 章：【標題】** 開頭
    - 故事本文（繁體中文，包含對話與細節）
