@@ -1,0 +1,92 @@
+# sleyStory — Project Summary
+
+**Last Updated:** 2026-06-03
+
+---
+
+## Project Aim
+
+**sleyStory** is an AI-powered **interactive long-form storytelling system** that generates branching narratives in **Traditional Chinese (繁體中文)**.
+
+### Core Goals
+- Support **very long stories** (dozens of chapters) without memory collapse or character drift.
+- Maintain **strong character consistency** (personality, goals, relationships).
+- Deliver **realistic consequences** — protagonist is not invincible; choices can lead to partial failure or setbacks.
+- Provide **immersive, dialogue-heavy** storytelling with rich sensory and emotional detail.
+- Allow users to generate AI images for key scenes via the "I" option.
+
+The system is designed so that future AI agents (when context window is full) can read this file to quickly understand the project's mission and current state.
+
+---
+
+## Completed Features
+
+### 1. Telegram Bot Interface
+- `/newstory`, `/loadstory`, `/mystories`, `/image_mode`
+- Choice-driven interaction (A/B/C/D/E + I for image)
+- Persistent per-user story sessions
+
+### 2. Hybrid Story Generation
+- **Main model**: Grok (xAI) — creative narrative generation
+- **Guardrail**: Local LM Studio model — enforces character consistency and rule compliance
+- Automatic retry + correction when guardrail detects violations
+
+### 3. Long-Term Memory System (v3)
+- **Story Bible** — condensed world state (locations, characters, active plot threads)
+- **Categorized Memories**:
+  - Locations
+  - Characters (with `long_term_goal`, `mid_term_goal`, `short_term_goal`)
+  - Events (detailed)
+  - Character Relationships (`trust_level`, `affection_level`, `tension_level`)
+- Database tables: `stories`, `chapters`, `memories`, `characters`, `character_relationships`
+
+### 4. Strict Output Format
+- Clean story text for user
+- Hidden `---\nDATA\n\`\`\`json` block for machine state sync
+- Automatic parsing and database update after every chapter
+
+### 5. Image Generation Support
+- "I) 生成本篇圖像" option at end of every chapter
+- `IMAGE_MODE` switch (`groq` = text prompt only, `comfyui` = local generation)
+- ComfyUI integration code exists (`generate_with_comfyui`) but currently uses a minimal hardcoded workflow
+
+### 6. Anti-Drift & Realism Rules (enforced via SKILL.md + guardrail)
+- Never contradict established facts
+- Characters act according to their stored goals and personality
+- Choices can result in failure, complications, or unintended consequences
+- Relationships evolve naturally over chapters
+
+---
+
+## Current Configuration (as of 2026-06-03)
+
+| Setting          | Value                          | Notes |
+|------------------|--------------------------------|-------|
+| `IMAGE_MODE`     | `groq`                         | Returns text prompt only |
+| `GROK_MODEL`     | `grok-4.3`                     | Main creative model |
+| `LM_STUDIO_MODEL`| `gemma-4-E4B`                  | Local guardrail |
+| ComfyUI          | Partially implemented          | Hardcoded workflow needs improvement |
+
+---
+
+## Known Limitations / TODOs
+
+- ComfyUI image generation is not reliable (hardcoded node IDs, empty prompt bug when choosing "I")
+- No automatic workflow loading from ComfyUI
+- Story Bible is only partially synced in the current JSON parsing logic
+- No web UI or story export feature yet
+- Need a robust way for future agents to load this summary when context is full
+
+---
+
+## Recommended Next Steps
+
+1. Improve ComfyUI integration (load saved workflow JSON or make it configurable)
+2. Add a proper image prompt generation step **before** calling image generation (currently passes empty content on "I")
+3. Create an `AGENTS.md` or update this file whenever major features are added
+4. Consider publishing the TellingStory repository as the canonical home for this project
+
+---
+
+**Purpose of this file**:  
+When the agent's context window is full, the next agent should read `PROJECT_SUMMARY.md` first to understand what has already been built and what the mission is.
