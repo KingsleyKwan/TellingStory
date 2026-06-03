@@ -886,20 +886,20 @@ async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.execute('''
             INSERT INTO memories (story_id, memory_type, key, value, updated_at)
             VALUES (?, ?, ?, ?, ?)
-        ''', (story_id, "bug_report", f"chapter_{prev_chapter_num}", 
+        ''', (story_id, "bug_report", f"chapter_{target_chapter_num}", 
               json.dumps({"bug": bug_description, "result_preview": analysis_result[:300]}, ensure_ascii=False),
               datetime.now().isoformat()))
         conn.commit()
         conn.close()
 
         # Lenient detection: look for chapter title pattern or explicit correction markers
-        has_chapter_title = bool(re.search(rf"第\s*{prev_chapter_num}\s*章", analysis_result))
+        has_chapter_title = bool(re.search(rf"第\s*{target_chapter_num}\s*章", analysis_result))
         looks_like_full_chapter = len(analysis_result) > 800 and has_chapter_title
         has_data_block = "---\nDATA" in analysis_result or "```json" in analysis_result
         is_correction = looks_like_full_chapter or has_data_block
 
         if "此回報不成立" in analysis_result or "不屬實" in analysis_result:
-            logger.info(f"Bug report on chapter {prev_chapter_num} rejected as invalid.")
+            logger.info(f"Bug report on chapter {target_chapter_num} rejected as invalid.")
             await update.message.reply_text(
                 f"審查結果：此回報不成立。\n\n{analysis_result}\n\n故事內容維持原狀。"
             )
