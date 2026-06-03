@@ -56,6 +56,13 @@ The system is designed so that future AI agents (when context window is full) ca
 - Choices can result in failure, complications, or unintended consequences
 - Relationships evolve naturally over chapters
 
+### 7. User-Driven Story Correction (`/bug`)
+- Users can report inconsistencies with `/bug <description>`
+- System uses Grok to verify if the reported conflict is real based on previous chapters.
+- If confirmed, the system **re-generates the previous chapter** with the correction applied and replaces it in the database.
+- Bug reports are stored in the `memories` table for audit trail.
+- Helps maintain long-term consistency when the model produces contradictions.
+
 ---
 
 ## Current Configuration (as of 2026-06-03)
