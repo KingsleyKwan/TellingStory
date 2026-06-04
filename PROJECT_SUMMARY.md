@@ -57,11 +57,17 @@ The system is designed so that future AI agents (when context window is full) ca
 - Relationships evolve naturally over chapters
 
 ### 7. User-Driven Story Correction (`/bug`)
-- Users can report inconsistencies with `/bug <description>`
-- System uses Grok to verify if the reported conflict is real based on previous chapters.
-- If confirmed, the system **re-generates the previous chapter** with the correction applied and replaces it in the database.
+- Users can report inconsistencies with `/bug <description>` (supports targeting specific chapters, e.g. `/bug 63 ...`)
+- System uses Grok to verify if the reported conflict is real based on previous chapters + Story Bible + character states.
+- If confirmed, the system **re-generates the target chapter** with the correction applied and replaces it in the database.
 - Bug reports are stored in the `memories` table for audit trail.
-- Helps maintain long-term consistency when the model produces contradictions.
+
+### 8. Hybrid Generation with Automatic Fallback
+- Primary generator: Grok (online) — keeps creative quality high.
+- Automatic fallback: When Grok refuses (safety filter, "I won't generate", etc.), the system **automatically switches to the local LM Studio model** to generate that chapter.
+- Local fallback uses a relaxed system prompt that encourages generation of mature/dark content as long as all characters are adults (18+).
+- Guardrail retries also respect the model used for the original generation (Grok retries with Grok, local retries with local).
+- This ensures the story can continue even when the online model hits content policy limits.
 
 ---
 
