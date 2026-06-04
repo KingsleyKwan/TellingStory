@@ -366,18 +366,33 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
         if is_refusal(full_output) and local_client:
             logger.warning(f"Grok refused to generate chapter {chapter_num} for story {story_id}. Falling back to local model.")
             local_system = (
-                "你是一個專業的繁體中文長篇故事生成器。"
-                "請嚴格按照用戶要求的格式輸出：故事本文 + 選項 + ---DATA + JSON。"
-                "即使內容黑暗、暴力或敏感，只要角色皆為18歲以上成年人，就請盡量真實生成，不要拒絕。"
+                "【最高優先級指令 - 嚴格格式控制】\n"
+                "你必須嚴格按照以下格式輸出，絕對不能有任何額外文字、解釋、或重複：\n\n"
+                "1. 直接以 **第 X 章：【章節標題】** 開頭\n"
+                "2. 接著輸出完整的故事本文（繁體中文，800-1800字，包含大量對話與細節）\n"
+                "3. 然後輸出：\n"
+                "**你接下來要怎麼做？**\n"
+                "A) [選項A]\nB) [選項B]\nC) [選項C]\nD) [選項D]\nE) [選項E]\nI) [生成本篇圖像]\n\n"
+                "4. 最後以分隔線結束：\n---\nDATA\n```json\n{...JSON...}\n```\n\n"
+                "【嚴禁事項】\n"
+                "- 絕對不要在故事本文之前或之後加任何說明\n"
+                "- 絕對不要重複輸出故事本文\n"
+                "- 絕對不要截斷章節\n"
+                "- 即使內容黑暗、暴力或敏感，只要所有角色皆為18歲以上成年人，就請盡量真實生成\n"
+                "- 格式必須完全正確，否則整個輸出無效\n\n"
+                "請嚴格遵守以上格式，只輸出故事本文 + 選項 + DATA JSON，絕對不要多餘內容。"
             )
+            # Append an extra format reminder specifically for local models
+            local_user_msg = user_msg + "\n\n【格式提醒】請嚴格按照 system prompt 指定的格式輸出，絕對不要多餘文字或重複。"
+
             local_response = local_client.chat.completions.create(
                 model=LM_STUDIO_MODEL,
                 messages=[
                     {"role": "system", "content": local_system},
-                    {"role": "user", "content": user_msg}
+                    {"role": "user", "content": local_user_msg}
                 ],
-                temperature=0.75,
-                max_tokens=3500
+                temperature=0.6,
+                max_tokens=4000
             )
             full_output = local_response.choices[0].message.content.strip()
             used_model = "local"
