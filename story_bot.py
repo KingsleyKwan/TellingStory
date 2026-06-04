@@ -47,6 +47,29 @@ COMFYUI_URL = os.getenv("COMFYUI_URL", "http://127.0.0.1:8188")
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "stories.db"
 
+# ====================== SIMPLE TTL CACHE ======================
+import time
+
+_STORY_CONTEXT_CACHE = {}          # story_id -> (timestamp, data)
+_CACHE_TTL_SECONDS = 45            # 45 seconds is a good balance
+
+def _get_cached_context(story_id: int):
+    entry = _STORY_CONTEXT_CACHE.get(story_id)
+    if entry:
+        ts, data = entry
+        if time.time() - ts < _CACHE_TTL_SECONDS:
+            return data
+    return None
+
+def _set_cached_context(story_id: int, data: dict):
+    _STORY_CONTEXT_CACHE[story_id] = (time.time(), data)
+
+def _invalidate_cache(story_id: int = None):
+    if story_id:
+        _STORY_CONTEXT_CACHE.pop(story_id, None)
+    else:
+        _STORY_CONTEXT_CACHE.clear()
+
 # ====================== DATABASE ======================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -124,6 +147,11 @@ init_db()
 
 # ====================== STORY GENERATION (with Story Bible) ======================
 def load_story_context(story_id: int) -> dict:
+    # Check memory cache first
+    cached = _get_cached_context(story_id)
+    if cached:
+        return cached
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
@@ -134,7 +162,7 @@ def load_story_context(story_id: int) -> dict:
 
     c.execute("""SELECT chapter_num, content, choice_made 
                  FROM chapters WHERE story_id = ? 
-                 ORDER BY chapter_num DESC LIMIT 4""", (story_id,))
+                 ORDER BY chapter_num DESC LIMIT 2""", (story_id,))
     recent = c.fetchall()
 
     # v3 - Load characters (gracefully handle if table is empty)
@@ -178,13 +206,16 @@ def load_story_context(story_id: int) -> dict:
 
     conn.close()
 
-    return {
+    result = {
         "story_bible": story_bible,
         "current_chapter": current_chapter,
         "recent_chapters": recent[::-1],
         "characters": characters,
         "relationships": relationships
     }
+
+    _set_cached_context(story_id, result)
+    return result
 
 
 def parse_choices(chapter_text: str) -> dict:
@@ -494,6 +525,8 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
         c.execute("UPDATE stories SET current_chapter = ? WHERE story_id = ?", (chapter_num, story_id))
         if new_bible:
             c.execute("UPDATE stories SET story_bible = ? WHERE story_id = ?", (new_bible, story_id))
+
+        _invalidate_cache(story_id)   # Invalidate cache after writing new chapter
 
         # ====================== v3 AUTO-SYNC: characters + relationships + memories ======================
         if parsed_json:
@@ -1009,6 +1042,7 @@ async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
             conn.close()
 
+            _invalidate_cache(story_id)
             context.user_data["last_choices"] = parse_choices(corrected_content)
             logger.info(f"Successfully replaced chapter {target_chapter_num} with corrected version for story {story_id}")
 
