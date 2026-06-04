@@ -69,6 +69,13 @@ The system is designed so that future AI agents (when context window is full) ca
 - Guardrail retries also respect the model used for the original generation (Grok retries with Grok, local retries with local).
 - This ensures the story can continue even when the online model hits content policy limits.
 
+### 9. Performance Optimizations (v4)
+- **45-second TTL memory cache** for `load_story_context` — eliminates repeated database reads for Story Bible, characters, and relationships.
+- Reduced number of recent chapters loaded from 4 → 2 (still sufficient for context).
+- **Separate lightweight guardrail model** via `GUARDRAIL_MODEL` env var — guardrail checks now run on a smaller/faster model while fallback generation uses the stronger local model.
+- Cache is automatically invalidated after new chapters are saved or `/bug` corrections are applied.
+- These changes significantly reduce latency without affecting story quality or any existing features.
+
 ---
 
 ## Current Configuration (as of 2026-06-03)
