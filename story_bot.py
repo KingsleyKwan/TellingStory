@@ -330,8 +330,26 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
     if not grok_client:
         return "錯誤：未設定 GROK_API_KEY，無法使用 Grok 生成故事。", chapter_num
 
+    # Refusal detection phrases (Grok and other online models commonly use these)
+    REFUSAL_PHRASES = [
+        "no. i won't generate",
+        "i won't generate",
+        "i cannot generate",
+        "i will not generate",
+        "i refuse to generate",
+        "i'm sorry, but i cannot",
+        "i'm unable to generate",
+        "this request violates",
+        "i can't assist with",
+        "i must decline",
+    ]
+
+    def is_refusal(text: str) -> bool:
+        text_lower = text.lower()
+        return any(phrase in text_lower for phrase in REFUSAL_PHRASES)
+
     try:
-        # Step 1: Generate with Grok
+        # Step 1: Generate with Grok (primary)
         response = grok_client.chat.completions.create(
             model=GROK_MODEL,
             messages=[
@@ -342,9 +360,33 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
             max_tokens=3500
         )
         full_output = response.choices[0].message.content.strip()
-        logger.info(f"Grok generated chapter {chapter_num} for story {story_id}")
+        used_model = "grok"
 
-        # Step 2: Guardrail check (up to 2 retries)
+        # Fallback to local AI if Grok refuses
+        if is_refusal(full_output) and local_client:
+            logger.warning(f"Grok refused to generate chapter {chapter_num} for story {story_id}. Falling back to local model.")
+            local_system = (
+                "你是一個專業的繁體中文長篇故事生成器。"
+                "請嚴格按照用戶要求的格式輸出：故事本文 + 選項 + ---DATA + JSON。"
+                "即使內容黑暗、暴力或敏感，只要角色皆為18歲以上成年人，就請盡量真實生成，不要拒絕。"
+            )
+            local_response = local_client.chat.completions.create(
+                model=LM_STUDIO_MODEL,
+                messages=[
+                    {"role": "system", "content": local_system},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.75,
+                max_tokens=3500
+            )
+            full_output = local_response.choices[0].message.content.strip()
+            used_model = "local"
+            logger.info(f"Local model generated chapter {chapter_num} for story {story_id} as fallback")
+
+        if used_model == "grok":
+            logger.info(f"Grok generated chapter {chapter_num} for story {story_id}")
+
+        # Step 2: Guardrail check (up to 2 retries) — use the same model that generated the chapter
         for attempt in range(3):
             guard = check_story_consistency(full_output, story_id)
             if guard.get("is_valid", True):
@@ -352,23 +394,40 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
             logger.warning(f"Guardrail violation on attempt {attempt+1}: {guard.get('violations')}")
             if attempt == 2:
                 break
-            # Ask Grok to fix
+
             fix_msg = f"""以下內容被本地 Guardrail 發現違反角色一致性：
 違規項目：{guard.get('violations')}
 修改建議：{guard.get('suggestions')}
 
 請根據建議重新生成修正版章節，保持原有風格與長度。"""
-            response = grok_client.chat.completions.create(
-                model=GROK_MODEL,
-                messages=[
-                    {"role": "system", "content": GROK_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                    {"role": "assistant", "content": full_output},
-                    {"role": "user", "content": fix_msg}
-                ],
-                temperature=0.7,
-                max_tokens=3500
-            )
+
+            if used_model == "grok" and grok_client:
+                response = grok_client.chat.completions.create(
+                    model=GROK_MODEL,
+                    messages=[
+                        {"role": "system", "content": GROK_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_msg},
+                        {"role": "assistant", "content": full_output},
+                        {"role": "user", "content": fix_msg}
+                    ],
+                    temperature=0.7,
+                    max_tokens=3500
+                )
+            elif used_model == "local" and local_client:
+                response = local_client.chat.completions.create(
+                    model=LM_STUDIO_MODEL,
+                    messages=[
+                        {"role": "system", "content": "你是一個嚴謹的故事一致性修正器，請根據 guardrail 建議修正章節。"},
+                        {"role": "user", "content": user_msg},
+                        {"role": "assistant", "content": full_output},
+                        {"role": "user", "content": fix_msg}
+                    ],
+                    temperature=0.6,
+                    max_tokens=3500
+                )
+            else:
+                break
+
             full_output = response.choices[0].message.content.strip()
 
         # ====================== NEW SEPARATED OUTPUT PARSING ======================
