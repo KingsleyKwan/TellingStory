@@ -983,11 +983,67 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, pr
     return None
 
 
+async def generate_with_grok_imagine(prompt: str, story_id: int, chapter_num: int) -> str:
+    """
+    Generate image using Grok Imagine API (xAI).
+    Uses the same grok_client (OpenAI-compatible) pointing to https://api.x.ai/v1
+    """
+    import aiohttp
+    import time
+    from pathlib import Path
+
+    if not grok_client:
+        logger.error("GROK_API_KEY not set, cannot use Grok Imagine")
+        return None
+
+    output_dir = Path("generated_images")
+    output_dir.mkdir(exist_ok=True)
+
+    # Use the higher quality model by default
+    model = "grok-imagine-image-quality"
+
+    try:
+        logger.info(f"Calling Grok Imagine API with model={model}")
+        response = grok_client.images.generate(
+            model=model,
+            prompt=prompt,
+            n=1,
+            response_format="url"
+        )
+
+        if not response.data or not response.data[0].url:
+            logger.error("Grok Imagine returned no image URL")
+            return None
+
+        image_url = response.data[0].url
+        logger.info(f"Grok Imagine returned URL: {image_url}")
+
+        # Download the image
+        local_filename = f"story_{story_id}_ch{chapter_num}_grok_{int(time.time())}.png"
+        local_path = output_dir / local_filename
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as img_resp:
+                if img_resp.status != 200:
+                    logger.error(f"Failed to download Grok image: HTTP {img_resp.status}")
+                    return None
+                with open(local_path, "wb") as f:
+                    f.write(await img_resp.read())
+
+        logger.info(f"Grok Imagine image saved: {local_path}")
+        return str(local_path)
+
+    except Exception as e:
+        logger.error(f"Grok Imagine generation failed: {e}")
+        return None
+
+
 async def generate_image_for_chapter(chapter_content: str, story_id: int, chapter_num: int, update: Update = None, mode: str = None) -> str:
     """
     Generate image for the chapter.
-    - If mode=="comfyui" or IMAGE_MODE=="comfyui": use local ComfyUI.
-    - Otherwise: return a prompt (or Grok path in future).
+    - If mode=="comfyui" or IMAGE_MODE=="comfyui": use local ComfyUI Flux.
+    - If mode=="grok" or IMAGE_MODE=="grok": use Grok Imagine API.
+    - Otherwise: fallback to prompt only.
     """
     prompt = await create_image_prompt(chapter_content)
     effective_mode = mode or IMAGE_MODE
@@ -1016,15 +1072,22 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
         return f"【圖像生成失敗】\nComfyUI 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
 
     else:
-        # Not using ComfyUI → just give the prompt
-        return f"【圖像 Prompt】\n（目前使用手動生成模式）\n\n{prompt}\n\n請複製以上 prompt 到 ComfyUI / Flux / Grok Imagine 等工具生成圖片。"
+        # Grok Imagine path
+        try:
+            image_path = await generate_with_grok_imagine(prompt, story_id, chapter_num)
+            if image_path:
+                return image_path
+        except Exception as e:
+            logger.error(f"Grok Imagine generation error: {e}")
+
+        return f"【圖像生成失敗】\nGrok Imagine 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
 
 
 async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global IMAGE_MODE
     args = context.args
-    if not args or args[0].lower() not in ["groq", "comfyui"]:
-        await update.message.reply_text("請輸入 `/image_mode groq` 或 `/image_mode comfyui`")
+    if not args or args[0].lower() not in ["grok", "comfyui"]:
+        await update.message.reply_text("請輸入 `/image_mode grok` 或 `/image_mode comfyui`")
         return
     IMAGE_MODE = args[0].lower()
     await update.message.reply_text(f"✅ 圖像生成模式已切換為：{IMAGE_MODE}")
