@@ -250,7 +250,8 @@ B) [選項B — 會帶來不同走向]
 C) [選項C]
 D) [選項D]
 E) [選項E — 可選]
-I) [生成本篇圖像] （為本章最重要場面生成AI圖像）
+I) [生成本篇圖像 - ComfyUI Flux]
+G) [生成本篇圖像 - Grok Imagine]
 
 ---
 DATA
@@ -413,7 +414,7 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
                 "2. 接著輸出完整的故事本文（繁體中文，800-1800字，包含大量對話與細節）\n"
                 "3. 然後輸出：\n"
                 "**你接下來要怎麼做？**\n"
-                "A) [選項A]\nB) [選項B]\nC) [選項C]\nD) [選項D]\nE) [選項E]\nI) [生成本篇圖像]\n\n"
+                "A) [選項A]\nB) [選項B]\nC) [選項C]\nD) [選項D]\nE) [選項E]\nI) [生成本篇圖像 - ComfyUI]\nG) [生成本篇圖像 - Grok]\n\n"
                 "4. 最後以分隔線結束：\n---\nDATA\n```json\n{...JSON...}\n```\n\n"
                 "【內容生成規則】\n"
                 "- 只要所有角色皆為18歲以上成年人，即使涉及黑暗、暴力、性化、催眠、非自願、角色主動參與等情節，也請盡量真實、沉浸式生成。\n"
@@ -769,16 +770,87 @@ async def load_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ====================== IMAGE GENERATION ======================
 
 async def create_image_prompt(chapter_content: str) -> str:
-    """Create a high-quality English prompt for image generation from chapter content."""
-    # Extract key visual elements
+    """Fallback simple prompt (used when optimizer is disabled)."""
     scene = chapter_content[:600].replace('\n', ' ').strip()
-
-    prompt = (
+    return (
         f"cinematic scene from a light novel, {scene}, "
         "highly detailed, beautiful lighting, expressive character faces, "
-        "atmospheric, fantasy adventure style, sharp focus, 8k --ar 16:9 --stylize 250"
+        "atmospheric, fantasy adventure style, sharp focus, 8k"
     )
-    return prompt
+
+
+async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
+    """
+    Convert raw story text into a high-quality, concise English prompt
+    optimized for Flux / Grok Imagine.
+
+    Backend selection via IMAGE_PROMPT_OPTIMIZER env var:
+      - "local"  → use LM Studio (default if available)
+      - "grok"   → use xAI Grok API (paid, higher quality)
+      - "auto"   → try local first, then grok, then simple prompt
+    """
+    backend = os.getenv("IMAGE_PROMPT_OPTIMIZER", "auto").lower()
+
+    system_prompt = (
+        "你是一個專業的 AI 圖像 Prompt 工程師。\n"
+        "請將以下故事章節內容轉換成**單一、精簡、高品質的英文 prompt**，適合 Flux 或 Grok Imagine 使用。\n\n"
+        "要求：\n"
+        "1. 提取主要角色外觀、服裝、姿態、表情\n"
+        "2. 描述場景、光線、氛圍、構圖（camera angle, lighting, mood）\n"
+        "3. 加入適當的藝術風格詞（cinematic, highly detailed, atmospheric）\n"
+        "4. 總長度控制在 80-130 tokens 以內\n"
+        "5. 直接輸出 prompt 文字，不要加解釋或引號\n"
+        "6. 如果有角色姓名，盡量保留外觀描述一致性"
+    )
+    user_msg = f"故事內容：\n{chapter_text[:1200]}"
+
+    def _call_optimizer(client, model_name: str, backend_name: str):
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.4,
+                max_tokens=200
+            )
+            optimized = resp.choices[0].message.content.strip()
+            optimized = optimized.replace("```", "").replace("prompt:", "").strip()
+            logger.info(f"[{backend_name}] Prompt optimized (len={len(optimized)}): {optimized[:120]}...")
+            return optimized
+        except Exception as e:
+            logger.warning(f"[{backend_name}] optimization failed: {e}")
+            return None
+
+    # Decide backend
+    if backend == "grok":
+        if not grok_client:
+            logger.warning("Grok client not available for prompt optimization")
+            return await create_image_prompt(chapter_text)
+        result = _call_optimizer(grok_client, GROK_MODEL, "grok")
+        return result or await create_image_prompt(chapter_text)
+
+    if backend == "local":
+        if not local_client:
+            logger.warning("Local client not available for prompt optimization")
+            return await create_image_prompt(chapter_text)
+        result = _call_optimizer(local_client, LM_STUDIO_MODEL, "local")
+        return result or await create_image_prompt(chapter_text)
+
+    # auto mode (default)
+    if local_client:
+        result = _call_optimizer(local_client, LM_STUDIO_MODEL, "local")
+        if result:
+            return result
+
+    if grok_client:
+        result = _call_optimizer(grok_client, GROK_MODEL, "grok")
+        if result:
+            return result
+
+    logger.warning("No optimizer backend available, using simple prompt")
+    return await create_image_prompt(chapter_text)
 
 
 async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, progress_message=None) -> str:
@@ -799,6 +871,7 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, pr
 
     # Prefer API-format workflow (exported via "Save (API Format)")
     api_workflow_candidates = [
+        BASE_DIR / "workflows" / "flux_workflow_api.json",
         BASE_DIR / "generated_images" / "flux_workflow_api.json",
         BASE_DIR / "generated_images" / "generated_images_flux_workflow_api.json",
     ]
@@ -936,15 +1009,38 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, pr
                             outputs = history[prompt_id].get("outputs", {})
                             for node_id, node_output in outputs.items():
                                 if "images" in node_output and node_output["images"]:
-                                    filename = node_output["images"][0]["filename"]
-                                    image_path = output_dir / filename
-                                    log(f"[{ts()}] ✅ Flux 圖像已生成: {image_path} (總耗時 {elapsed}s)")
+                                    img_info = node_output["images"][0]
+                                    filename = img_info["filename"]
+                                    subfolder = img_info.get("subfolder", "")
+
+                                    # Download the image from ComfyUI to ensure it's accessible
+                                    local_filename = f"story_{story_id}_ch{chapter_num}_{int(time.time())}.png"
+                                    local_path = output_dir / local_filename
+
+                                    try:
+                                        view_url = f"{COMFYUI_URL}/view"
+                                        params = {"filename": filename}
+                                        if subfolder:
+                                            params["subfolder"] = subfolder
+
+                                        async with session.get(view_url, params=params) as img_resp:
+                                            if img_resp.status == 200:
+                                                with open(local_path, "wb") as f:
+                                                    f.write(await img_resp.read())
+                                                log(f"[{ts()}] ✅ 已下載圖像到: {local_path} (總耗時 {elapsed}s)")
+                                            else:
+                                                log(f"[{ts()}] 下載圖像失敗，狀態碼 {img_resp.status}")
+                                                continue
+                                    except Exception as dl_err:
+                                        log(f"[{ts()}] 下載圖像例外: {dl_err}")
+                                        continue
+
                                     if progress_message:
                                         try:
                                             await progress_message.edit_text(f"✅ 圖像生成完成！(耗時 {elapsed}s)")
                                         except:
                                             pass
-                                    return str(image_path)
+                                    return str(local_path)
 
                     if i % 15 == 0:
                         log(f"[{ts()}] 仍在輪詢... elapsed={elapsed}s")
@@ -958,19 +1054,90 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, pr
     return None
 
 
-async def generate_image_for_chapter(chapter_content: str, story_id: int, chapter_num: int, update: Update = None) -> str:
+async def generate_with_grok_imagine(prompt: str, story_id: int, chapter_num: int, model: str = None) -> str:
+    """
+    Generate image using Grok Imagine API (xAI).
+    Supports two tiers:
+      - grok-imagine-image-quality  (default, higher quality, ~$0.05/img)
+      - grok-imagine-image          (faster & cheaper, ~$0.02/img)
+    """
+    import aiohttp
+    import time
+    from pathlib import Path
+
+    if not grok_client:
+        logger.error("GROK_API_KEY not set, cannot use Grok Imagine")
+        return None
+
+    output_dir = Path("generated_images")
+    output_dir.mkdir(exist_ok=True)
+
+    # Choose model
+    model = model or os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-quality")
+
+    try:
+        logger.info(f"Calling Grok Imagine API with model={model}")
+        response = grok_client.images.generate(
+            model=model,
+            prompt=prompt,
+            n=1,
+            response_format="url"
+        )
+
+        if not response.data or not response.data[0].url:
+            logger.error("Grok Imagine returned no image URL")
+            return None
+
+        image_url = response.data[0].url
+        logger.info(f"Grok Imagine returned URL: {image_url}")
+
+        # Download the image
+        local_filename = f"story_{story_id}_ch{chapter_num}_grok_{int(time.time())}.png"
+        local_path = output_dir / local_filename
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as img_resp:
+                if img_resp.status != 200:
+                    logger.error(f"Failed to download Grok image: HTTP {img_resp.status}")
+                    return None
+                with open(local_path, "wb") as f:
+                    f.write(await img_resp.read())
+
+        logger.info(f"Grok Imagine image saved: {local_path}")
+        return str(local_path)
+
+    except Exception as e:
+        logger.error(f"Grok Imagine generation failed: {e}")
+        return None
+
+
+async def generate_image_for_chapter(chapter_content: str, story_id: int, chapter_num: int, update: Update = None, mode: str = None) -> str:
     """
     Generate image for the chapter.
-    - If IMAGE_MODE == "comfyui": try to call local ComfyUI + send live status every 30s.
-    - Otherwise / on failure: return a high-quality prompt for the user to use manually.
+    - If mode=="comfyui" or IMAGE_MODE=="comfyui": use local ComfyUI Flux.
+    - If mode=="grok" or IMAGE_MODE=="grok": use Grok Imagine API.
+    - Otherwise: fallback to prompt only.
     """
-    prompt = await create_image_prompt(chapter_content)
+    # Prompt optimization (recommended for better image quality)
+    use_optimizer = os.getenv("USE_IMAGE_PROMPT_OPTIMIZER", "true").lower() == "true"
+    if use_optimizer:
+        prompt = await optimize_image_prompt(chapter_content, story_id)
+        logger.info("Using optimized image prompt")
+    else:
+        prompt = await create_image_prompt(chapter_content)
+        logger.info("Using simple image prompt (optimizer disabled)")
 
-    if IMAGE_MODE == "comfyui":
+    effective_mode = mode or IMAGE_MODE
+
+    if effective_mode == "comfyui":
         progress_msg = None
         if update:
             try:
-                progress_msg = await update.message.reply_text("🖼️ 正在使用 ComfyUI Flux 生成圖像... (已等待 0s)")
+                progress_msg = await update.message.reply_text(
+                    "🖼️ 正在使用 ComfyUI Flux 生成圖像...\n"
+                    "預計時間：4-7 分鐘（視硬件而定）\n"
+                    "每 30 秒更新一次狀態"
+                )
             except Exception as e:
                 logger.warning(f"無法發送進度訊息: {e}")
 
@@ -986,18 +1153,44 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
         return f"【圖像生成失敗】\nComfyUI 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
 
     else:
-        # Not using ComfyUI → just give the prompt
-        return f"【圖像 Prompt】\n（目前使用手動生成模式）\n\n{prompt}\n\n請複製以上 prompt 到 ComfyUI / Flux / Grok Imagine 等工具生成圖片。"
+        # Grok Imagine path
+        grok_model = os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-quality")
+        try:
+            image_path = await generate_with_grok_imagine(prompt, story_id, chapter_num, model=grok_model)
+            if image_path:
+                return image_path
+        except Exception as e:
+            logger.error(f"Grok Imagine generation error: {e}")
+
+        return f"【圖像生成失敗】\nGrok Imagine 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
 
 
 async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global IMAGE_MODE
     args = context.args
-    if not args or args[0].lower() not in ["groq", "comfyui"]:
-        await update.message.reply_text("請輸入 `/image_mode groq` 或 `/image_mode comfyui`")
+    valid_modes = ["grok", "grok-quality", "grok-fast", "comfyui"]
+    if not args or args[0].lower() not in valid_modes:
+        await update.message.reply_text(
+            "請輸入：\n"
+            "`/image_mode grok`（預設 quality）\n"
+            "`/image_mode grok-quality`（高品質）\n"
+            "`/image_mode grok-fast`（較快較便宜）\n"
+            "`/image_mode comfyui`（本地 Flux）"
+        )
         return
-    IMAGE_MODE = args[0].lower()
-    await update.message.reply_text(f"✅ 圖像生成模式已切換為：{IMAGE_MODE}")
+
+    mode = args[0].lower()
+    IMAGE_MODE = mode
+
+    # Map shortcut to actual model for Grok
+    if mode == "grok-quality":
+        os.environ["GROK_IMAGE_MODEL"] = "grok-imagine-image-quality"
+    elif mode == "grok-fast":
+        os.environ["GROK_IMAGE_MODEL"] = "grok-imagine-image"
+    elif mode == "grok":
+        os.environ["GROK_IMAGE_MODEL"] = "grok-imagine-image-quality"  # default to quality
+
+    await update.message.reply_text(f"✅ 圖像生成模式已切換為：{mode}")
 
 
 async def test_guardrail(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1225,30 +1418,55 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     choice_upper = resolved_choice.upper()
 
-    # Handle "I" option first (image generation)
+    # Handle "I" (ComfyUI) and "G" (Grok) image generation options
     if choice_upper.startswith("I") or choice_upper == "I":
-        # First, try to generate the image (without generating the chapter yet)
-        # We pass a placeholder to get the prompt / result
-        temp_result = await generate_image_for_chapter("", story_id, 0, update=update)
+        image_mode = "comfyui"
+        image_label = "ComfyUI Flux"
+    elif choice_upper.startswith("G") or choice_upper == "G":
+        image_mode = "grok"
+        image_label = "Grok Imagine"
+    else:
+        image_mode = None
+
+    if image_mode:
+        # Send immediate progress message for Grok (it is usually fast)
+        if image_mode == "grok":
+            tier = os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-quality")
+            tier_name = "高品質" if "quality" in tier else "快速"
+            try:
+                await update.message.reply_text(
+                    f"🖼️ 正在使用 Grok Imagine（{tier_name}）生成圖像...\n"
+                    "預計 5-15 秒（視 prompt 複雜度而定）"
+                )
+            except Exception:
+                pass
+
+        # Pass mode explicitly so we don't mutate the global IMAGE_MODE
+        temp_result = await generate_image_for_chapter("", story_id, 0, update=update, mode=image_mode)
 
         if temp_result and not temp_result.startswith("【"):
-            # Image can be generated → now generate the chapter normally
-            chapter_text, ch_num = generate_chapter(story_id, user_choice=resolved_choice)
-            context.user_data["last_choices"] = parse_choices(chapter_text)
-
             try:
-                await update.message.reply_photo(
-                    photo=open(temp_result, "rb"),
-                    caption=f"（第 {ch_num} 章）\n\n{chapter_text[:800]}..."
-                )
+                from telegram import InputFile
+                with open(temp_result, "rb") as photo_file:
+                    await update.message.reply_photo(
+                        photo=InputFile(photo_file, filename=os.path.basename(temp_result)),
+                        caption=f"🖼️ 使用 {image_label} 生成的圖像"
+                    )
+                logger.info(f"{image_label} image sent successfully: {temp_result}")
             except Exception as e:
-                logger.error(f"Failed to send image: {e}")
-                await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n（圖像發送失敗）")
-        else:
-            # Image generation not available → ask user to choose a normal option
+                logger.error(f"Failed to send {image_label} image {temp_result}: {e}")
+                await update.message.reply_text(f"❌ 圖像生成完成，但發送失敗。\n路徑：{temp_result}")
+
+            # After sending image, stop and ask user to choose next option
             await update.message.reply_text(
-                "圖像無法生成。\n"
-                "請重新選擇其他選項（A / B / C / D / E）。"
+                "圖像已發送 ✅\n\n"
+                "請選擇下一步要怎麼做：\n"
+                "A / B / C / D / E / I（ComfyUI） / G（Grok）"
+            )
+        else:
+            await update.message.reply_text(
+                f"使用 {image_label} 生成圖像失敗。\n"
+                "請重新選擇其他選項（A / B / C / D / E / I / G）。"
             )
         return
 
