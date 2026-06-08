@@ -806,16 +806,15 @@ async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
 
     system_prompt = (
         "你是一個專業的 AI 圖像 Prompt 工程師。\n"
-        "請將以下故事章節內容轉換成**單一、精簡、高品質的英文 prompt**，適合 Flux 或 Grok Imagine 使用。\n\n"
-        "要求：\n"
-        "1. 提取主要角色外觀、服裝、姿態、表情\n"
-        "2. 描述場景、光線、氛圍、構圖（camera angle, lighting, mood）\n"
-        "3. 加入適當的藝術風格詞（cinematic, highly detailed, atmospheric）\n"
-        "4. 總長度控制在 80-130 tokens 以內\n"
-        "5. 直接輸出 prompt 文字，不要加解釋或引號\n"
-        "6. 如果有角色姓名，盡量保留外觀描述一致性"
+        "你的任務是從故事章節中，**只提取最主要的一個視覺場景**，然後轉換成適合 Flux / Grok Imagine 的英文 prompt。\n\n"
+        "嚴格規則：\n"
+        "1. 忽略對話、內心獨白、劇情解釋，只保留「畫面能看到的東西」（角色外觀、動作、服裝、場景、光線、氛圍）。\n"
+        "2. 找出章節中最有畫面感的那一刻（例如：主角站在懸崖上、兩人對峙、魔法爆發等）。\n"
+        "3. 輸出必須是單一段落、精簡、有電影感的英文 prompt（80-140 tokens）。\n"
+        "4. 開頭建議用 'cinematic scene from a light novel,' 或 'highly detailed anime style,' 等。\n"
+        "5. 直接輸出 prompt 文字，不要加任何解釋、引號或前綴。"
     )
-    user_msg = f"故事內容：\n{chapter_text[:1200]}"
+    user_msg = f"以下是故事章節內容，請提取主要視覺場景：\n\n{chapter_text[:1500]}"
 
     def _call_optimizer(client, model_name: str, backend_name: str):
         try:
