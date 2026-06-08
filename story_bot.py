@@ -782,10 +782,11 @@ async def load_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ====================== IMAGE GENERATION ======================
 
-async def create_image_prompt(chapter_content: str) -> str:
+async def create_image_prompt(chapter_content: str, story_id: int = None) -> str:
     """
     Smart fallback prompt generator.
     Cleans raw chapter text and extracts visual elements only.
+    If the cleaned text is too short/empty, returns a safe generic prompt.
     """
     import re
 
