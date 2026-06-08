@@ -81,7 +81,8 @@ def init_db():
         story_bible TEXT,
         current_chapter INTEGER DEFAULT 1,
         created_at TEXT,
-        image_style TEXT DEFAULT 'real'
+        image_style TEXT DEFAULT 'real',
+        image_style_prompt TEXT
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS chapters (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,7 +96,11 @@ def init_db():
     try:
         c.execute("ALTER TABLE stories ADD COLUMN image_style TEXT DEFAULT 'real'")
     except sqlite3.OperationalError:
-        pass  # column already exists
+        pass
+    try:
+        c.execute("ALTER TABLE stories ADD COLUMN image_style_prompt TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     c.execute('''CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -833,6 +838,60 @@ async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
             return None
 
     # Decide backend
+
+async def expand_style_description(style_name: str) -> str:
+    """
+    Use AI (local or Grok) to turn a short style name (e.g. "SAO", "某某畫家")
+    into a rich, detailed prompt fragment that both online and local models can understand.
+    """
+    if not style_name or style_name.lower() == "real":
+        return ""
+
+    system_prompt = (
+        "你是一個專業的圖像風格描述工程師。\n"
+        "請將以下簡短的圖像風格名稱，擴展成一段詳細、適合 Flux 或 Grok Imagine 使用的英文描述。\n"
+        "包含：色彩調性、光影風格、線條特徵、氛圍、常見構圖元素、角色設計傾向等。\n"
+        "直接輸出描述文字，不要加解釋或引號。"
+    )
+    user_msg = f"風格名稱：{style_name}"
+
+    # Try local first, then Grok
+    if local_client:
+        try:
+            resp = local_client.chat.completions.create(
+                model=LM_STUDIO_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.5,
+                max_tokens=150
+            )
+            desc = resp.choices[0].message.content.strip()
+            logger.info(f"Style description (local): {desc[:120]}...")
+            return desc
+        except Exception as e:
+            logger.warning(f"Local style expansion failed: {e}")
+
+    if grok_client:
+        try:
+            resp = grok_client.chat.completions.create(
+                model=GROK_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.5,
+                max_tokens=150
+            )
+            desc = resp.choices[0].message.content.strip()
+            logger.info(f"Style description (grok): {desc[:120]}...")
+            return desc
+        except Exception as e:
+            logger.warning(f"Grok style expansion failed: {e}")
+
+    # Fallback: just use the original name
+    return f"in the style of {style_name}"
     if backend == "grok":
         if not grok_client:
             logger.warning("Grok client not available for prompt optimization")
@@ -1144,15 +1203,20 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
         prompt = await create_image_prompt(chapter_content)
         logger.info("Using simple image prompt (optimizer disabled)")
 
-    # Inject per-story image style into the prompt (before logging)
+    # Inject per-story image style into the prompt (prefer expanded prompt if available)
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("SELECT image_style FROM stories WHERE story_id = ?", (story_id,))
+        c.execute("SELECT image_style, image_style_prompt FROM stories WHERE story_id = ?", (story_id,))
         row = c.fetchone()
         conn.close()
         style = row[0] if row and row[0] else "real"
-        if style and style.lower() != "real":
+        expanded_prompt = row[1] if row and row[1] else None
+
+        if expanded_prompt:
+            prompt = f"{prompt}, {expanded_prompt}"
+            logger.info(f"Applied expanded image_style_prompt (len={len(expanded_prompt)})")
+        elif style and style.lower() != "real":
             prompt = f"{prompt}, in the style of {style}"
             logger.info(f"Applied story image_style: {style}")
     except Exception as e:
@@ -1250,13 +1314,23 @@ async def set_story_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("參數錯誤。請使用 `/setstyle <風格>` 或 `/setstyle <ID> <風格>`")
         return
 
+    # Expand style into detailed prompt
+    expanded = await expand_style_description(style)
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("UPDATE stories SET image_style = ? WHERE story_id = ?", (style, target_story))
+    c.execute("""
+        UPDATE stories 
+        SET image_style = ?, image_style_prompt = ?
+        WHERE story_id = ?
+    """, (style, expanded, target_story))
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(f"✅ 故事 {target_story} 的圖像風格已設為：`{style}`")
+    await update.message.reply_text(
+        f"✅ 故事 {target_story} 的圖像風格已設為：`{style}`\n"
+        f"已自動擴展為詳細描述（供本地模型使用）。"
+    )
 
 
 async def test_guardrail(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1503,13 +1577,23 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_story = context.user_data.get("awaiting_image_style_for")
     if pending_story and not text.startswith("/") and not text.upper() in ["A","B","C","D","E","I","G"]:
         style = text.strip()
+        # Expand the style into a rich description using AI
+        expanded = await expand_style_description(style)
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("UPDATE stories SET image_style = ? WHERE story_id = ?", (style, pending_story))
+        c.execute("""
+            UPDATE stories 
+            SET image_style = ?, image_style_prompt = ?
+            WHERE story_id = ?
+        """, (style, expanded, pending_story))
         conn.commit()
         conn.close()
         context.user_data.pop("awaiting_image_style_for", None)
-        await update.message.reply_text(f"✅ 已將故事 {pending_story} 的圖像風格設為：`{style}`\n\n請繼續選擇下一步（A/B/C/D/E/I/G）。")
+        await update.message.reply_text(
+            f"✅ 已將故事 {pending_story} 的圖像風格設為：`{style}`\n"
+            f"已自動擴展為詳細描述（供本地模型使用）。\n\n"
+            f"請繼續選擇下一步（A/B/C/D/E/I/G）。"
+        )
         return
 
     if not story_id:
