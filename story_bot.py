@@ -781,12 +781,15 @@ async def create_image_prompt(chapter_content: str) -> str:
 
 async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
     """
-    Use local LM Studio to convert raw story text into a high-quality,
-    concise English prompt optimized for Flux / Grok Imagine.
+    Convert raw story text into a high-quality, concise English prompt
+    optimized for Flux / Grok Imagine.
+
+    Backend selection via IMAGE_PROMPT_OPTIMIZER env var:
+      - "local"  → use LM Studio (default if available)
+      - "grok"   → use xAI Grok API (paid, higher quality)
+      - "auto"   → try local first, then grok, then simple prompt
     """
-    if not local_client:
-        logger.warning("local_client not available, falling back to simple prompt")
-        return await create_image_prompt(chapter_text)
+    backend = os.getenv("IMAGE_PROMPT_OPTIMIZER", "auto").lower()
 
     system_prompt = (
         "你是一個專業的 AI 圖像 Prompt 工程師。\n"
@@ -799,27 +802,55 @@ async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
         "5. 直接輸出 prompt 文字，不要加解釋或引號\n"
         "6. 如果有角色姓名，盡量保留外觀描述一致性"
     )
-
     user_msg = f"故事內容：\n{chapter_text[:1200]}"
 
-    try:
-        response = local_client.chat.completions.create(
-            model=LM_STUDIO_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg}
-            ],
-            temperature=0.4,
-            max_tokens=200
-        )
-        optimized = response.choices[0].message.content.strip()
-        # Clean up common artifacts
-        optimized = optimized.replace("```", "").replace("prompt:", "").strip()
-        logger.info(f"Prompt optimized (len={len(optimized)}): {optimized[:120]}...")
-        return optimized
-    except Exception as e:
-        logger.warning(f"Prompt optimization failed, using fallback: {e}")
-        return await create_image_prompt(chapter_text)
+    def _call_optimizer(client, model_name: str, backend_name: str):
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.4,
+                max_tokens=200
+            )
+            optimized = resp.choices[0].message.content.strip()
+            optimized = optimized.replace("```", "").replace("prompt:", "").strip()
+            logger.info(f"[{backend_name}] Prompt optimized (len={len(optimized)}): {optimized[:120]}...")
+            return optimized
+        except Exception as e:
+            logger.warning(f"[{backend_name}] optimization failed: {e}")
+            return None
+
+    # Decide backend
+    if backend == "grok":
+        if not grok_client:
+            logger.warning("Grok client not available for prompt optimization")
+            return await create_image_prompt(chapter_text)
+        result = _call_optimizer(grok_client, GROK_MODEL, "grok")
+        return result or await create_image_prompt(chapter_text)
+
+    if backend == "local":
+        if not local_client:
+            logger.warning("Local client not available for prompt optimization")
+            return await create_image_prompt(chapter_text)
+        result = _call_optimizer(local_client, LM_STUDIO_MODEL, "local")
+        return result or await create_image_prompt(chapter_text)
+
+    # auto mode (default)
+    if local_client:
+        result = _call_optimizer(local_client, LM_STUDIO_MODEL, "local")
+        if result:
+            return result
+
+    if grok_client:
+        result = _call_optimizer(grok_client, GROK_MODEL, "grok")
+        if result:
+            return result
+
+    logger.warning("No optimizer backend available, using simple prompt")
+    return await create_image_prompt(chapter_text)
 
 
 async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, progress_message=None) -> str:
