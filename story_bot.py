@@ -770,16 +770,56 @@ async def load_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ====================== IMAGE GENERATION ======================
 
 async def create_image_prompt(chapter_content: str) -> str:
-    """Create a high-quality English prompt for image generation from chapter content."""
-    # Extract key visual elements
+    """Fallback simple prompt (used when optimizer is disabled)."""
     scene = chapter_content[:600].replace('\n', ' ').strip()
-
-    prompt = (
+    return (
         f"cinematic scene from a light novel, {scene}, "
         "highly detailed, beautiful lighting, expressive character faces, "
-        "atmospheric, fantasy adventure style, sharp focus, 8k --ar 16:9 --stylize 250"
+        "atmospheric, fantasy adventure style, sharp focus, 8k"
     )
-    return prompt
+
+
+async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
+    """
+    Use local LM Studio to convert raw story text into a high-quality,
+    concise English prompt optimized for Flux / Grok Imagine.
+    """
+    if not local_client:
+        logger.warning("local_client not available, falling back to simple prompt")
+        return await create_image_prompt(chapter_text)
+
+    system_prompt = (
+        "你是一個專業的 AI 圖像 Prompt 工程師。\n"
+        "請將以下故事章節內容轉換成**單一、精簡、高品質的英文 prompt**，適合 Flux 或 Grok Imagine 使用。\n\n"
+        "要求：\n"
+        "1. 提取主要角色外觀、服裝、姿態、表情\n"
+        "2. 描述場景、光線、氛圍、構圖（camera angle, lighting, mood）\n"
+        "3. 加入適當的藝術風格詞（cinematic, highly detailed, atmospheric）\n"
+        "4. 總長度控制在 80-130 tokens 以內\n"
+        "5. 直接輸出 prompt 文字，不要加解釋或引號\n"
+        "6. 如果有角色姓名，盡量保留外觀描述一致性"
+    )
+
+    user_msg = f"故事內容：\n{chapter_text[:1200]}"
+
+    try:
+        response = local_client.chat.completions.create(
+            model=LM_STUDIO_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg}
+            ],
+            temperature=0.4,
+            max_tokens=200
+        )
+        optimized = response.choices[0].message.content.strip()
+        # Clean up common artifacts
+        optimized = optimized.replace("```", "").replace("prompt:", "").strip()
+        logger.info(f"Prompt optimized (len={len(optimized)}): {optimized[:120]}...")
+        return optimized
+    except Exception as e:
+        logger.warning(f"Prompt optimization failed, using fallback: {e}")
+        return await create_image_prompt(chapter_text)
 
 
 async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, progress_message=None) -> str:
@@ -1047,7 +1087,15 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
     - If mode=="grok" or IMAGE_MODE=="grok": use Grok Imagine API.
     - Otherwise: fallback to prompt only.
     """
-    prompt = await create_image_prompt(chapter_content)
+    # Prompt optimization (recommended for better image quality)
+    use_optimizer = os.getenv("USE_IMAGE_PROMPT_OPTIMIZER", "true").lower() == "true"
+    if use_optimizer:
+        prompt = await optimize_image_prompt(chapter_content, story_id)
+        logger.info("Using optimized image prompt")
+    else:
+        prompt = await create_image_prompt(chapter_content)
+        logger.info("Using simple image prompt (optimizer disabled)")
+
     effective_mode = mode or IMAGE_MODE
 
     if effective_mode == "comfyui":
