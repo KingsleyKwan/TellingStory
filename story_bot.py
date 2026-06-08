@@ -1091,11 +1091,18 @@ async def generate_with_grok_imagine(prompt: str, story_id: int, chapter_num: in
         image_url = response.data[0].url
         logger.info(f"Grok Imagine returned URL: {image_url}")
 
-        # Download the image
+        # Download the image (with proper SSL handling for macOS)
         local_filename = f"story_{story_id}_ch{chapter_num}_grok_{int(time.time())}.png"
         local_path = output_dir / local_filename
 
-        async with aiohttp.ClientSession() as session:
+        # Use certifi for reliable CA certificates (fixes macOS SSL issues)
+        import ssl
+        import certifi
+
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(image_url) as img_resp:
                 if img_resp.status != 200:
                     logger.error(f"Failed to download Grok image: HTTP {img_resp.status}")
@@ -1450,12 +1457,20 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with open(temp_result, "rb") as photo_file:
                     await update.message.reply_photo(
                         photo=InputFile(photo_file, filename=os.path.basename(temp_result)),
-                        caption=f"🖼️ 使用 {image_label} 生成的圖像"
+                        caption=f"🖼️ 使用 {image_label} 生成的圖像",
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=30
                     )
                 logger.info(f"{image_label} image sent successfully: {temp_result}")
             except Exception as e:
                 logger.error(f"Failed to send {image_label} image {temp_result}: {e}")
-                await update.message.reply_text(f"❌ 圖像生成完成，但發送失敗。\n路徑：{temp_result}")
+                # Even if the coroutine times out, the image often still arrives.
+                # We still inform the user, but the photo may appear later.
+                await update.message.reply_text(
+                    f"⚠️ 圖像已上傳，但 Telegram 回應超時。\n"
+                    f"如果圖片未出現，請稍後再試。\n路徑：{temp_result}"
+                )
 
             # After sending image, stop and ask user to choose next option
             await update.message.reply_text(
