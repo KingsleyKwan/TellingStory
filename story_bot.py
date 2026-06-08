@@ -983,10 +983,12 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, pr
     return None
 
 
-async def generate_with_grok_imagine(prompt: str, story_id: int, chapter_num: int) -> str:
+async def generate_with_grok_imagine(prompt: str, story_id: int, chapter_num: int, model: str = None) -> str:
     """
     Generate image using Grok Imagine API (xAI).
-    Uses the same grok_client (OpenAI-compatible) pointing to https://api.x.ai/v1
+    Supports two tiers:
+      - grok-imagine-image-quality  (default, higher quality, ~$0.05/img)
+      - grok-imagine-image          (faster & cheaper, ~$0.02/img)
     """
     import aiohttp
     import time
@@ -999,8 +1001,8 @@ async def generate_with_grok_imagine(prompt: str, story_id: int, chapter_num: in
     output_dir = Path("generated_images")
     output_dir.mkdir(exist_ok=True)
 
-    # Use the higher quality model by default
-    model = "grok-imagine-image-quality"
+    # Choose model
+    model = model or os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-quality")
 
     try:
         logger.info(f"Calling Grok Imagine API with model={model}")
@@ -1073,8 +1075,9 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
 
     else:
         # Grok Imagine path
+        grok_model = os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-quality")
         try:
-            image_path = await generate_with_grok_imagine(prompt, story_id, chapter_num)
+            image_path = await generate_with_grok_imagine(prompt, story_id, chapter_num, model=grok_model)
             if image_path:
                 return image_path
         except Exception as e:
@@ -1086,11 +1089,29 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
 async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global IMAGE_MODE
     args = context.args
-    if not args or args[0].lower() not in ["grok", "comfyui"]:
-        await update.message.reply_text("請輸入 `/image_mode grok` 或 `/image_mode comfyui`")
+    valid_modes = ["grok", "grok-quality", "grok-fast", "comfyui"]
+    if not args or args[0].lower() not in valid_modes:
+        await update.message.reply_text(
+            "請輸入：\n"
+            "`/image_mode grok`（預設 quality）\n"
+            "`/image_mode grok-quality`（高品質）\n"
+            "`/image_mode grok-fast`（較快較便宜）\n"
+            "`/image_mode comfyui`（本地 Flux）"
+        )
         return
-    IMAGE_MODE = args[0].lower()
-    await update.message.reply_text(f"✅ 圖像生成模式已切換為：{IMAGE_MODE}")
+
+    mode = args[0].lower()
+    IMAGE_MODE = mode
+
+    # Map shortcut to actual model for Grok
+    if mode == "grok-quality":
+        os.environ["GROK_IMAGE_MODEL"] = "grok-imagine-image-quality"
+    elif mode == "grok-fast":
+        os.environ["GROK_IMAGE_MODEL"] = "grok-imagine-image"
+    elif mode == "grok":
+        os.environ["GROK_IMAGE_MODEL"] = "grok-imagine-image-quality"  # default to quality
+
+    await update.message.reply_text(f"✅ 圖像生成模式已切換為：{mode}")
 
 
 async def test_guardrail(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1329,6 +1350,18 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_mode = None
 
     if image_mode:
+        # Send immediate progress message for Grok (it is usually fast)
+        if image_mode == "grok":
+            tier = os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-quality")
+            tier_name = "高品質" if "quality" in tier else "快速"
+            try:
+                await update.message.reply_text(
+                    f"🖼️ 正在使用 Grok Imagine（{tier_name}）生成圖像...\n"
+                    "預計 5-15 秒（視 prompt 複雜度而定）"
+                )
+            except Exception:
+                pass
+
         # Pass mode explicitly so we don't mutate the global IMAGE_MODE
         temp_result = await generate_image_for_chapter("", story_id, 0, update=update, mode=image_mode)
 
