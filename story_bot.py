@@ -801,21 +801,31 @@ async def create_image_prompt(chapter_content: str, story_id: int = None) -> str
     if choices_pos != -1:
         text = text[:choices_pos]
 
-    # 3. Remove lines that look like dialogue (containing 「」)
-    lines = text.split('\n')
-    cleaned_lines = []
-    for line in lines:
-        if '「' in line or '」' in line:
-            continue
-        cleaned_lines.append(line)
-    text = ' '.join(cleaned_lines)
+    # 3. Strip quoted dialogue (「...」, 『...』, "...", '...') but keep surrounding narration.
+    #    Then drop lines that become too short or empty after stripping.
+    def _strip_dialogue(line: str) -> str:
+        line = re.sub(r'「[^」]*」', '', line)
+        line = re.sub(r'『[^』]*』', '', line)
+        line = re.sub(r'"[^"]*"', '', line)
+        line = re.sub(r"'[^']*'", '', line)
+        return line.strip()
 
-    # 4. Remove excessive punctuation and normalize whitespace
-    text = re.sub(r'[「」『』【】《》]', '', text)
+    lines = text.split('\n')
+    kept = []
+    for line in lines:
+        cleaned = _strip_dialogue(line)
+        # Keep lines that still contain meaningful descriptive content
+        if len(cleaned) >= 8 and not re.match(r'^[\s，。！？、…—\-–\.\,\!\?]+$', cleaned):
+            kept.append(cleaned)
+
+    text = ' '.join(kept)
+
+    # 4. Remove remaining punctuation artifacts and normalize whitespace
+    text = re.sub(r'[「」『』【】《》「」]', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
 
-    # 5. Take a reasonable length (first ~450 chars after cleaning)
-    scene = text[:450].strip()
+    # 5. Take more text now that we preserve narration (first ~700 chars)
+    scene = text[:700].strip()
 
     # 6. If scene is too short or empty, use a safe generic prompt
     if len(scene) < 30:
