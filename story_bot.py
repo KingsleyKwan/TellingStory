@@ -799,6 +799,7 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, pr
 
     # Prefer API-format workflow (exported via "Save (API Format)")
     api_workflow_candidates = [
+        BASE_DIR / "workflows" / "flux_workflow_api.json",
         BASE_DIR / "generated_images" / "flux_workflow_api.json",
         BASE_DIR / "generated_images" / "generated_images_flux_workflow_api.json",
     ]
@@ -936,15 +937,38 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, pr
                             outputs = history[prompt_id].get("outputs", {})
                             for node_id, node_output in outputs.items():
                                 if "images" in node_output and node_output["images"]:
-                                    filename = node_output["images"][0]["filename"]
-                                    image_path = output_dir / filename
-                                    log(f"[{ts()}] ✅ Flux 圖像已生成: {image_path} (總耗時 {elapsed}s)")
+                                    img_info = node_output["images"][0]
+                                    filename = img_info["filename"]
+                                    subfolder = img_info.get("subfolder", "")
+
+                                    # Download the image from ComfyUI to ensure it's accessible
+                                    local_filename = f"story_{story_id}_ch{chapter_num}_{int(time.time())}.png"
+                                    local_path = output_dir / local_filename
+
+                                    try:
+                                        view_url = f"{COMFYUI_URL}/view"
+                                        params = {"filename": filename}
+                                        if subfolder:
+                                            params["subfolder"] = subfolder
+
+                                        async with session.get(view_url, params=params) as img_resp:
+                                            if img_resp.status == 200:
+                                                with open(local_path, "wb") as f:
+                                                    f.write(await img_resp.read())
+                                                log(f"[{ts()}] ✅ 已下載圖像到: {local_path} (總耗時 {elapsed}s)")
+                                            else:
+                                                log(f"[{ts()}] 下載圖像失敗，狀態碼 {img_resp.status}")
+                                                continue
+                                    except Exception as dl_err:
+                                        log(f"[{ts()}] 下載圖像例外: {dl_err}")
+                                        continue
+
                                     if progress_message:
                                         try:
                                             await progress_message.edit_text(f"✅ 圖像生成完成！(耗時 {elapsed}s)")
                                         except:
                                             pass
-                                    return str(image_path)
+                                    return str(local_path)
 
                     if i % 15 == 0:
                         log(f"[{ts()}] 仍在輪詢... elapsed={elapsed}s")
@@ -970,7 +994,11 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
         progress_msg = None
         if update:
             try:
-                progress_msg = await update.message.reply_text("🖼️ 正在使用 ComfyUI Flux 生成圖像... (已等待 0s)")
+                progress_msg = await update.message.reply_text(
+                    "🖼️ 正在使用 ComfyUI Flux 生成圖像...\n"
+                    "預計時間：4-7 分鐘（視硬件而定）\n"
+                    "每 30 秒更新一次狀態"
+                )
             except Exception as e:
                 logger.warning(f"無法發送進度訊息: {e}")
 
@@ -1237,13 +1265,16 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["last_choices"] = parse_choices(chapter_text)
 
             try:
-                await update.message.reply_photo(
-                    photo=open(temp_result, "rb"),
-                    caption=f"（第 {ch_num} 章）\n\n{chapter_text[:800]}..."
-                )
+                from telegram import InputFile
+                with open(temp_result, "rb") as photo_file:
+                    await update.message.reply_photo(
+                        photo=InputFile(photo_file, filename=os.path.basename(temp_result)),
+                        caption=f"（第 {ch_num} 章）\n\n{chapter_text[:800]}..."
+                    )
+                logger.info(f"Image sent successfully: {temp_result}")
             except Exception as e:
-                logger.error(f"Failed to send image: {e}")
-                await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n（圖像發送失敗）")
+                logger.error(f"Failed to send image {temp_result}: {e}")
+                await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n（圖像發送失敗，檔案路徑：{temp_result}）")
         else:
             # Image generation not available → ask user to choose a normal option
             await update.message.reply_text(
