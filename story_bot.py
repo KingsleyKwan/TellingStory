@@ -41,7 +41,7 @@ LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "gemma-4-E4B")
 local_client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
 
 # Image mode
-IMAGE_MODE = os.getenv("IMAGE_MODE", "groq").lower()  # groq or comfyui
+IMAGE_MODE = os.getenv("IMAGE_MODE", "comfyui").lower()  # comfyui or grok
 COMFYUI_URL = os.getenv("COMFYUI_URL", "http://127.0.0.1:8188")
 
 BASE_DIR = Path(__file__).parent
@@ -782,32 +782,46 @@ async def create_image_prompt(chapter_content: str) -> str:
 
 
 async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int) -> str:
-    """Generate image using local ComfyUI."""
+    """Generate image using the user's tuned Flux GGUF workflow (flux_workflow.json)."""
     import aiohttp
-    import os
+    import json
     from pathlib import Path
 
     output_dir = Path("generated_images")
     output_dir.mkdir(exist_ok=True)
-
-    # Minimal ComfyUI workflow (text-to-image)
-    # This assumes the user has a basic txt2img workflow with node IDs 1-8
-    workflow = {
-        "1": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["4", 1], "text": prompt}},
-        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["4", 1], "text": "low quality, blurry"}},
-        "3": {"class_type": "KSampler", "inputs": {
-            "seed": 123456, "steps": 20, "cfg": 7.5, "sampler_name": "euler",
-            "scheduler": "normal", "denoise": 1.0,
-            "model": ["4", 0], "positive": ["1", 0], "negative": ["2", 0],
-            "latent_image": ["5", 0]
-        }},
-        "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
-        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 576, "batch_size": 1}},
-        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["4", 2]}},
-        "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": f"story_{story_id}_ch{chapter_num}", "images": ["6", 0]}}
-    }
+    workflow_path = BASE_DIR / "generated_images" / "flux_workflow.json"
 
     try:
+        with open(workflow_path, "r", encoding="utf-8") as f:
+            workflow = json.load(f)
+
+        # Inject positive prompt into node 3 (CLIPTextEncode for positive conditioning)
+        # The user's workflow has node 3 as the positive prompt node
+        if "3" in workflow.get("nodes", []):  # safety for list form, but our JSON uses dict keys in "nodes" wait, actually top-level nodes array
+            pass  # our JSON stores nodes as list; we need to find by id
+
+        # The saved JSON uses a list under "nodes". Find node id==3
+        for node in workflow.get("nodes", []):
+            if node.get("id") == 3 and node.get("type") == "CLIPTextEncode":
+                # widgets_values[0] holds the prompt text in ComfyUI JSON exports
+                if "widgets_values" in node and len(node["widgets_values"]) > 0:
+                    node["widgets_values"][0] = prompt
+                break
+
+        # Update SaveImage filename prefix (node 10)
+        for node in workflow.get("nodes", []):
+            if node.get("id") == 10 and node.get("type") == "SaveImage":
+                node["widgets_values"] = [f"story_{story_id}_ch{chapter_num}_"]
+                break
+
+        # Optional: randomize seed in KSampler (node 7) for variety
+        import random
+        for node in workflow.get("nodes", []):
+            if node.get("id") == 7 and node.get("type") == "KSampler":
+                if "widgets_values" in node and len(node["widgets_values"]) > 0:
+                    node["widgets_values"][0] = random.randint(1, 2**31 - 1)
+                break
+
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow}) as resp:
                 if resp.status != 200:
@@ -816,8 +830,10 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int) ->
 
                 result = await resp.json()
                 prompt_id = result.get("prompt_id")
+                if not prompt_id:
+                    return None
 
-                # Wait for completion (simple polling)
+                # Poll history up to ~60s
                 for _ in range(30):
                     await asyncio.sleep(2)
                     async with session.get(f"{COMFYUI_URL}/history/{prompt_id}") as hist_resp:
@@ -825,13 +841,13 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int) ->
                         if prompt_id in history:
                             outputs = history[prompt_id].get("outputs", {})
                             for node_id, node_output in outputs.items():
-                                if "images" in node_output:
+                                if "images" in node_output and node_output["images"]:
                                     filename = node_output["images"][0]["filename"]
                                     image_path = output_dir / filename
-                                    logger.info(f"Image saved: {image_path}")
+                                    logger.info(f"Flux image saved: {image_path}")
                                     return str(image_path)
     except Exception as e:
-        logger.error(f"ComfyUI generation failed: {e}")
+        logger.error(f"ComfyUI Flux generation failed: {e}")
         return None
 
     return None
@@ -880,6 +896,20 @@ async def test_guardrail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sample = "Sley 突然變成冷酷殺手，忘記了他一直以來的熱血性格。"
     result = check_story_consistency(sample, story_id)
     await update.message.reply_text(f"Guardrail 測試結果：\n{json.dumps(result, ensure_ascii=False, indent=2)}")
+
+
+async def test_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test ComfyUI / Grok image generation for current story."""
+    story_id = context.user_data.get("current_story_id")
+    if not story_id:
+        await update.message.reply_text("請先載入一個故事（/loadstory <ID>）")
+        return
+    sample_text = "主角站在月光下的古老寺廟前，風吹動他的長袍，眼神堅定。"
+    result = await generate_image_for_chapter(sample_text, story_id, 99)
+    if result and result.startswith("/"):
+        await update.message.reply_text(f"✅ 測試圖像已生成：{result}")
+    else:
+        await update.message.reply_text(f"圖像測試結果：\n{result}")
 
 
 async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1124,6 +1154,7 @@ def main():
     app.add_handler(CommandHandler("loadstory", load_story))
     app.add_handler(CommandHandler("image_mode", set_image_mode))
     app.add_handler(CommandHandler("test_guardrail", test_guardrail))
+    app.add_handler(CommandHandler("test_image", test_image))
     app.add_handler(CommandHandler("bug", handle_bug_report))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice))
 
