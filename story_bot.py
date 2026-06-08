@@ -815,8 +815,9 @@ async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
                 temperature=0.4,
                 max_tokens=200
             )
-            optimized = resp.choices[0].message.content.strip()
-            optimized = optimized.replace("```", "").replace("prompt:", "").strip()
+            raw = resp.choices[0].message.content.strip()
+            logger.info(f"[{backend_name}] RAW optimizer output: {raw[:200]}...")
+            optimized = raw.replace("```", "").replace("prompt:", "").strip()
             logger.info(f"[{backend_name}] Prompt optimized (len={len(optimized)}): {optimized[:120]}...")
             return optimized
         except Exception as e:
@@ -1133,6 +1134,9 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
     else:
         prompt = await create_image_prompt(chapter_content)
         logger.info("Using simple image prompt (optimizer disabled)")
+
+    # === DEBUG LOG: show exactly what prompt is sent to the image generator ===
+    logger.info(f"[FINAL IMAGE PROMPT] {prompt}")
 
     effective_mode = mode or IMAGE_MODE
 
