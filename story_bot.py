@@ -805,16 +805,20 @@ async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
     backend = os.getenv("IMAGE_PROMPT_OPTIMIZER", "auto").lower()
 
     system_prompt = (
-        "你是一個專業的 AI 圖像 Prompt 工程師。\n"
-        "你的任務是從故事章節中，**只提取最主要的一個視覺場景**，然後轉換成適合 Flux / Grok Imagine 的英文 prompt。\n\n"
-        "嚴格規則：\n"
-        "1. 忽略對話、內心獨白、劇情解釋，只保留「畫面能看到的東西」（角色外觀、動作、服裝、場景、光線、氛圍）。\n"
-        "2. 找出章節中最有畫面感的那一刻（例如：主角站在懸崖上、兩人對峙、魔法爆發等）。\n"
-        "3. 輸出必須是單一段落、精簡、有電影感的英文 prompt（80-140 tokens）。\n"
-        "4. 開頭建議用 'cinematic scene from a light novel,' 或 'highly detailed anime style,' 等。\n"
-        "5. 直接輸出 prompt 文字，不要加任何解釋、引號或前綴。"
+        "你是一個嚴格的 AI 圖像 Prompt 工程師。\n"
+        "你的任務是**只從故事章節中找出最主要的一個視覺畫面**，然後輸出適合 Flux / Grok Imagine 的英文 prompt。\n\n"
+        "【絕對禁止事項】\n"
+        "- 不要包含任何對話、內心獨白、劇情解釋或故事背景。\n"
+        "- 不要總結章節內容。\n"
+        "- 不要使用中文。\n\n"
+        "【必須遵守】\n"
+        "1. 只描述「畫面能看到的東西」：角色外觀、動作、服裝、場景、光線、氛圍、構圖。\n"
+        "2. 挑選章節中最有畫面感的那一刻（例如：主角被包圍、魔法爆發、兩人對峙等）。\n"
+        "3. 輸出必須是單一段落、電影感強、細節豐富的英文 prompt（控制在 70-130 tokens）。\n"
+        "4. 開頭請用 'cinematic scene from a light novel,' 或 'highly detailed anime illustration,' 等。\n"
+        "5. 直接輸出 prompt 文字，不要任何解釋或引號。"
     )
-    user_msg = f"以下是故事章節內容，請提取主要視覺場景：\n\n{chapter_text[:1500]}"
+    user_msg = f"請只提取以下章節中最主要的一個視覺畫面：\n\n{chapter_text[:1400]}"
 
     def _call_optimizer(client, model_name: str, backend_name: str):
         try:
@@ -824,14 +828,21 @@ async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_msg}
                 ],
-                temperature=0.4,
-                max_tokens=200
+                temperature=0.25,
+                max_tokens=160
             )
             raw = resp.choices[0].message.content.strip()
             logger.info(f"[{backend_name}] RAW optimizer output: {raw[:200]}...")
-            optimized = raw.replace("```", "").replace("prompt:", "").strip()
-            logger.info(f"[{backend_name}] Prompt optimized (len={len(optimized)}): {optimized[:120]}...")
-            return optimized
+
+            # Post-processing: remove Chinese, quotes, and truncate if too long
+            import re
+            cleaned = re.sub(r'[\u4e00-\u9fff]+', '', raw)  # remove Chinese characters
+            cleaned = cleaned.replace("```", "").replace('"', '').replace("'", "").strip()
+            if len(cleaned) > 450:
+                cleaned = cleaned[:450].rsplit('.', 1)[0] + '.'
+
+            logger.info(f"[{backend_name}] Prompt optimized (len={len(cleaned)}): {cleaned[:120]}...")
+            return cleaned if cleaned else None
         except Exception as e:
             logger.warning(f"[{backend_name}] optimization failed: {e}")
             return None
