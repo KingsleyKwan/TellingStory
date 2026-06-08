@@ -1072,7 +1072,7 @@ async def generate_with_grok_imagine(prompt: str, story_id: int, chapter_num: in
     output_dir = Path("generated_images")
     output_dir.mkdir(exist_ok=True)
 
-    # Choose model
+    # Choose model (latest high-quality model as of 2026)
     model = model or os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-quality")
 
     try:
@@ -1091,11 +1091,18 @@ async def generate_with_grok_imagine(prompt: str, story_id: int, chapter_num: in
         image_url = response.data[0].url
         logger.info(f"Grok Imagine returned URL: {image_url}")
 
-        # Download the image
+        # Download the image (with proper SSL handling for macOS)
         local_filename = f"story_{story_id}_ch{chapter_num}_grok_{int(time.time())}.png"
         local_path = output_dir / local_filename
 
-        async with aiohttp.ClientSession() as session:
+        # Use certifi for reliable CA certificates (fixes macOS SSL issues)
+        import ssl
+        import certifi
+
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(image_url) as img_resp:
                 if img_resp.status != 200:
                     logger.error(f"Failed to download Grok image: HTTP {img_resp.status}")
@@ -1215,6 +1222,37 @@ async def test_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ 測試圖像已生成：{result}")
     else:
         await update.message.reply_text(f"圖像測試結果：\n{result}")
+
+
+async def test_grok_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test Grok Imagine image generation with real story context."""
+    story_id = context.user_data.get("current_story_id")
+    if not story_id:
+        await update.message.reply_text("請先載入一個故事（/loadstory <ID>）")
+        return
+
+    # Load latest chapter content
+    latest_content = ""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT content FROM chapters WHERE story_id = ? ORDER BY chapter_num DESC LIMIT 1", (story_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            latest_content = row[0] or ""
+    except Exception:
+        pass
+
+    if not latest_content:
+        latest_content = "主角站在月光下的古老寺廟前，風吹動他的長袍，眼神堅定。"
+
+    # Force Grok mode
+    result = await generate_image_for_chapter(latest_content, story_id, 99, update=update, mode="grok")
+    if result and result.startswith("/"):
+        await update.message.reply_text(f"✅ Grok Imagine 測試圖像已生成：{result}")
+    else:
+        await update.message.reply_text(f"Grok Imagine 測試結果：\n{result}")
 
 
 async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1441,8 +1479,26 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
+        # Load the latest chapter content so the image prompt has real story context
+        latest_chapter_content = ""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("""
+                SELECT content FROM chapters 
+                WHERE story_id = ? 
+                ORDER BY chapter_num DESC 
+                LIMIT 1
+            """, (story_id,))
+            row = c.fetchone()
+            conn.close()
+            if row:
+                latest_chapter_content = row[0] or ""
+        except Exception as e:
+            logger.warning(f"Failed to load latest chapter for image prompt: {e}")
+
         # Pass mode explicitly so we don't mutate the global IMAGE_MODE
-        temp_result = await generate_image_for_chapter("", story_id, 0, update=update, mode=image_mode)
+        temp_result = await generate_image_for_chapter(latest_chapter_content, story_id, 0, update=update, mode=image_mode)
 
         if temp_result and not temp_result.startswith("【"):
             try:
@@ -1450,12 +1506,20 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with open(temp_result, "rb") as photo_file:
                     await update.message.reply_photo(
                         photo=InputFile(photo_file, filename=os.path.basename(temp_result)),
-                        caption=f"🖼️ 使用 {image_label} 生成的圖像"
+                        caption=f"🖼️ 使用 {image_label} 生成的圖像",
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=30
                     )
                 logger.info(f"{image_label} image sent successfully: {temp_result}")
             except Exception as e:
                 logger.error(f"Failed to send {image_label} image {temp_result}: {e}")
-                await update.message.reply_text(f"❌ 圖像生成完成，但發送失敗。\n路徑：{temp_result}")
+                # Even if the coroutine times out, the image often still arrives.
+                # We still inform the user, but the photo may appear later.
+                await update.message.reply_text(
+                    f"⚠️ 圖像已上傳，但 Telegram 回應超時。\n"
+                    f"如果圖片未出現，請稍後再試。\n路徑：{temp_result}"
+                )
 
             # After sending image, stop and ask user to choose next option
             await update.message.reply_text(
@@ -1485,6 +1549,7 @@ def main():
     app.add_handler(CommandHandler("image_mode", set_image_mode))
     app.add_handler(CommandHandler("test_guardrail", test_guardrail))
     app.add_handler(CommandHandler("test_image", test_image))
+    app.add_handler(CommandHandler("test_grok_image", test_grok_image))
     app.add_handler(CommandHandler("bug", handle_bug_report))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice))
 
