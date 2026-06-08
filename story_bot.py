@@ -41,11 +41,34 @@ LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "gemma-4-E4B")
 local_client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
 
 # Image mode
-IMAGE_MODE = os.getenv("IMAGE_MODE", "groq").lower()  # groq or comfyui
+IMAGE_MODE = os.getenv("IMAGE_MODE", "comfyui").lower()  # comfyui or grok
 COMFYUI_URL = os.getenv("COMFYUI_URL", "http://127.0.0.1:8188")
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "stories.db"
+
+# ====================== SIMPLE TTL CACHE ======================
+import time
+
+_STORY_CONTEXT_CACHE = {}          # story_id -> (timestamp, data)
+_CACHE_TTL_SECONDS = 45            # 45 seconds is a good balance
+
+def _get_cached_context(story_id: int):
+    entry = _STORY_CONTEXT_CACHE.get(story_id)
+    if entry:
+        ts, data = entry
+        if time.time() - ts < _CACHE_TTL_SECONDS:
+            return data
+    return None
+
+def _set_cached_context(story_id: int, data: dict):
+    _STORY_CONTEXT_CACHE[story_id] = (time.time(), data)
+
+def _invalidate_cache(story_id: int = None):
+    if story_id:
+        _STORY_CONTEXT_CACHE.pop(story_id, None)
+    else:
+        _STORY_CONTEXT_CACHE.clear()
 
 # ====================== DATABASE ======================
 def init_db():
@@ -124,6 +147,11 @@ init_db()
 
 # ====================== STORY GENERATION (with Story Bible) ======================
 def load_story_context(story_id: int) -> dict:
+    # Check memory cache first
+    cached = _get_cached_context(story_id)
+    if cached:
+        return cached
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
@@ -134,7 +162,7 @@ def load_story_context(story_id: int) -> dict:
 
     c.execute("""SELECT chapter_num, content, choice_made 
                  FROM chapters WHERE story_id = ? 
-                 ORDER BY chapter_num DESC LIMIT 4""", (story_id,))
+                 ORDER BY chapter_num DESC LIMIT 2""", (story_id,))
     recent = c.fetchall()
 
     # v3 - Load characters (gracefully handle if table is empty)
@@ -178,13 +206,16 @@ def load_story_context(story_id: int) -> dict:
 
     conn.close()
 
-    return {
+    result = {
         "story_bible": story_bible,
         "current_chapter": current_chapter,
         "recent_chapters": recent[::-1],
         "characters": characters,
         "relationships": relationships
     }
+
+    _set_cached_context(story_id, result)
+    return result
 
 
 def parse_choices(chapter_text: str) -> dict:
@@ -495,6 +526,8 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
         if new_bible:
             c.execute("UPDATE stories SET story_bible = ? WHERE story_id = ?", (new_bible, story_id))
 
+        _invalidate_cache(story_id)   # Invalidate cache after writing new chapter
+
         # ====================== v3 AUTO-SYNC: characters + relationships + memories ======================
         if parsed_json:
             try:
@@ -748,74 +781,146 @@ async def create_image_prompt(chapter_content: str) -> str:
     return prompt
 
 
-async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int) -> str:
-    """Generate image using local ComfyUI."""
+async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, progress_message=None) -> str:
+    """
+    Generate image using the user's tuned Flux GGUF workflow (flux_workflow.json).
+    - progress_message: optional Telegram message to edit with live status every 30s.
+    """
     import aiohttp
-    import os
+    import json
+    import random
+    import time
     from pathlib import Path
+    from datetime import datetime
 
+    start_time = time.time()
     output_dir = Path("generated_images")
     output_dir.mkdir(exist_ok=True)
+    workflow_path = BASE_DIR / "generated_images" / "flux_workflow.json"
 
-    # Minimal ComfyUI workflow (text-to-image)
-    # This assumes the user has a basic txt2img workflow with node IDs 1-8
-    workflow = {
-        "1": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["4", 1], "text": prompt}},
-        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["4", 1], "text": "low quality, blurry"}},
-        "3": {"class_type": "KSampler", "inputs": {
-            "seed": 123456, "steps": 20, "cfg": 7.5, "sampler_name": "euler",
-            "scheduler": "normal", "denoise": 1.0,
-            "model": ["4", 0], "positive": ["1", 0], "negative": ["2", 0],
-            "latent_image": ["5", 0]
-        }},
-        "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
-        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 576, "batch_size": 1}},
-        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["4", 2]}},
-        "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": f"story_{story_id}_ch{chapter_num}", "images": ["6", 0]}}
-    }
+    def ts():
+        return datetime.now().strftime("%H:%M:%S")
+
+    def log(msg):
+        logger.info(f"[{ts()}] {msg}")
+
+    log(f"開始 ComfyUI Flux 生成 | story={story_id} chapter={chapter_num}")
 
     try:
-        async with aiohttp.ClientSession() as session:
+        log(f"載入 workflow: {workflow_path}")
+        with open(workflow_path, "r", encoding="utf-8") as f:
+            workflow = json.load(f)
+        log("workflow JSON 載入成功")
+
+        # Inject positive prompt into node 3
+        for node in workflow.get("nodes", []):
+            if node.get("id") == 3 and node.get("type") == "CLIPTextEncode":
+                if "widgets_values" in node and len(node["widgets_values"]) > 0:
+                    node["widgets_values"][0] = prompt
+                log(f"[{ts()}] 已注入正向 prompt 到 node 3")
+                break
+
+        # Update SaveImage filename prefix (node 10)
+        for node in workflow.get("nodes", []):
+            if node.get("id") == 10 and node.get("type") == "SaveImage":
+                node["widgets_values"] = [f"story_{story_id}_ch{chapter_num}_"]
+                log(f"[{ts()}] 已更新 SaveImage 檔名前綴")
+                break
+
+        # Randomize seed
+        for node in workflow.get("nodes", []):
+            if node.get("id") == 7 and node.get("type") == "KSampler":
+                if "widgets_values" in node and len(node["widgets_values"]) > 0:
+                    node["widgets_values"][0] = random.randint(1, 2**31 - 1)
+                log(f"[{ts()}] 已隨機化 KSampler seed")
+                break
+
+        log(f"[{ts()}] 準備 POST 到 ComfyUI: {COMFYUI_URL}/prompt")
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow}) as resp:
+                log(f"[{ts()}] ComfyUI 回應狀態碼: {resp.status}")
                 if resp.status != 200:
-                    logger.error(f"ComfyUI returned status {resp.status}")
+                    logger.error(f"[{ts()}] ComfyUI returned status {resp.status}")
                     return None
 
                 result = await resp.json()
                 prompt_id = result.get("prompt_id")
+                if not prompt_id:
+                    log(f"[{ts()}] 沒有收到 prompt_id，結束")
+                    return None
 
-                # Wait for completion (simple polling)
-                for _ in range(30):
-                    await asyncio.sleep(2)
+                log(f"[{ts()}] 取得 prompt_id = {prompt_id}，開始輪詢 history...")
+
+                max_wait_seconds = 600  # 10 分鐘
+                poll_interval = 2
+                heartbeat_interval = 30  # 每 30 秒更新 Telegram
+                last_heartbeat = time.time()
+
+                for i in range(max_wait_seconds // poll_interval):
+                    await asyncio.sleep(poll_interval)
+                    elapsed = int(time.time() - start_time)
+
+                    # Telegram heartbeat every 30s
+                    if progress_message and (time.time() - last_heartbeat >= heartbeat_interval):
+                        status = "正常" if elapsed < 300 else "可能卡住"
+                        try:
+                            await progress_message.edit_text(
+                                f"🖼️ 正在使用 ComfyUI Flux 生成圖像...\n"
+                                f"已等待 {elapsed}s | 狀態：{status}\n"
+                                f"prompt_id: {prompt_id}"
+                            )
+                            last_heartbeat = time.time()
+                            log(f"[{ts()}] 已更新 Telegram 狀態 (elapsed={elapsed}s)")
+                        except Exception as edit_err:
+                            logger.warning(f"[{ts()}] 無法編輯 Telegram 訊息: {edit_err}")
+
                     async with session.get(f"{COMFYUI_URL}/history/{prompt_id}") as hist_resp:
                         history = await hist_resp.json()
                         if prompt_id in history:
                             outputs = history[prompt_id].get("outputs", {})
                             for node_id, node_output in outputs.items():
-                                if "images" in node_output:
+                                if "images" in node_output and node_output["images"]:
                                     filename = node_output["images"][0]["filename"]
                                     image_path = output_dir / filename
-                                    logger.info(f"Image saved: {image_path}")
+                                    log(f"[{ts()}] ✅ Flux 圖像已生成: {image_path} (總耗時 {elapsed}s)")
+                                    if progress_message:
+                                        try:
+                                            await progress_message.edit_text(f"✅ 圖像生成完成！(耗時 {elapsed}s)")
+                                        except:
+                                            pass
                                     return str(image_path)
+
+                    if i % 15 == 0:
+                        log(f"[{ts()}] 仍在輪詢... elapsed={elapsed}s")
+
     except Exception as e:
-        logger.error(f"ComfyUI generation failed: {e}")
+        log(f"[{ts()}] ComfyUI Flux generation 發生例外: {e}")
+        logger.error(f"ComfyUI Flux generation failed: {e}")
         return None
 
+    log(f"[{ts()}] 超時 ({max_wait_seconds}s) 仍未完成，結束")
     return None
 
 
-async def generate_image_for_chapter(chapter_content: str, story_id: int, chapter_num: int) -> str:
+async def generate_image_for_chapter(chapter_content: str, story_id: int, chapter_num: int, update: Update = None) -> str:
     """
     Generate image for the chapter.
-    - If IMAGE_MODE == "comfyui": try to call local ComfyUI.
+    - If IMAGE_MODE == "comfyui": try to call local ComfyUI + send live status every 30s.
     - Otherwise / on failure: return a high-quality prompt for the user to use manually.
     """
     prompt = await create_image_prompt(chapter_content)
 
     if IMAGE_MODE == "comfyui":
+        progress_msg = None
+        if update:
+            try:
+                progress_msg = await update.message.reply_text("🖼️ 正在使用 ComfyUI Flux 生成圖像... (已等待 0s)")
+            except Exception as e:
+                logger.warning(f"無法發送進度訊息: {e}")
+
         # Try real ComfyUI generation
         try:
-            image_path = await generate_with_comfyui(prompt, story_id, chapter_num)
+            image_path = await generate_with_comfyui(prompt, story_id, chapter_num, progress_message=progress_msg)
             if image_path:
                 return image_path
         except Exception as e:
@@ -847,6 +952,20 @@ async def test_guardrail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sample = "Sley 突然變成冷酷殺手，忘記了他一直以來的熱血性格。"
     result = check_story_consistency(sample, story_id)
     await update.message.reply_text(f"Guardrail 測試結果：\n{json.dumps(result, ensure_ascii=False, indent=2)}")
+
+
+async def test_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test ComfyUI / Grok image generation for current story."""
+    story_id = context.user_data.get("current_story_id")
+    if not story_id:
+        await update.message.reply_text("請先載入一個故事（/loadstory <ID>）")
+        return
+    sample_text = "主角站在月光下的古老寺廟前，風吹動他的長袍，眼神堅定。"
+    result = await generate_image_for_chapter(sample_text, story_id, 99, update=update)
+    if result and result.startswith("/"):
+        await update.message.reply_text(f"✅ 測試圖像已生成：{result}")
+    else:
+        await update.message.reply_text(f"圖像測試結果：\n{result}")
 
 
 async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1009,6 +1128,7 @@ async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
             conn.close()
 
+            _invalidate_cache(story_id)
             context.user_data["last_choices"] = parse_choices(corrected_content)
             logger.info(f"Successfully replaced chapter {target_chapter_num} with corrected version for story {story_id}")
 
@@ -1053,7 +1173,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if choice_upper.startswith("I") or choice_upper == "I":
         # First, try to generate the image (without generating the chapter yet)
         # We pass a placeholder to get the prompt / result
-        temp_result = await generate_image_for_chapter("", story_id, 0)
+        temp_result = await generate_image_for_chapter("", story_id, 0, update=update)
 
         if temp_result and not temp_result.startswith("【"):
             # Image can be generated → now generate the chapter normally
@@ -1090,6 +1210,7 @@ def main():
     app.add_handler(CommandHandler("loadstory", load_story))
     app.add_handler(CommandHandler("image_mode", set_image_mode))
     app.add_handler(CommandHandler("test_guardrail", test_guardrail))
+    app.add_handler(CommandHandler("test_image", test_image))
     app.add_handler(CommandHandler("bug", handle_bug_report))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice))
 

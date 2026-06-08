@@ -16,8 +16,10 @@ load_dotenv()
 DB_PATH = Path(__file__).parent / "stories.db"
 LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://192.168.1.96:1234/v1")
 LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "gemma-4-E4B")
+GUARDRAIL_MODEL = os.getenv("GUARDRAIL_MODEL", "gemma-2b-it")   # lighter/faster model for guardrail only
 
 local_client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
+guardrail_client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
 
 
 def load_characters_and_relationships(story_id: int) -> dict:
@@ -121,8 +123,8 @@ def check_story_consistency(story_text: str, story_id: int, relevant_characters:
 請嚴格檢查並以 JSON 格式回覆。"""
 
     try:
-        response = local_client.chat.completions.create(
-            model=LM_STUDIO_MODEL,
+        response = guardrail_client.chat.completions.create(
+            model=GUARDRAIL_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg}

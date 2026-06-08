@@ -1,0 +1,110 @@
+{
+  "last_node_id": 12,
+  "last_link_id": 15,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "UnetLoaderGGUF",
+      "pos": [80, 60],
+      "size": { "0": 315, "1": 82 },
+      "widgets_values": ["flux1-dev-Q4_K_M.gguf", "default"],
+      "outputs": [{ "name": "MODEL", "type": "MODEL", "links": [1] }]
+    },
+    {
+      "id": 2,
+      "type": "DualCLIPLoaderGGUF",
+      "pos": [80, 180],
+      "size": { "0": 315, "1": 106 },
+      "widgets_values": ["t5-v1_1-xxl-encoder-Q4_K_M.gguf", "clip_l.safetensors", "flux"],
+      "outputs": [{ "name": "CLIP", "type": "CLIP", "links": [2] }]
+    },
+    {
+      "id": 3,
+      "type": "CLIPTextEncode",
+      "pos": [450, 60],
+      "size": { "0": 315, "1": 120 },
+      "widgets_values": ["a cinematic scene from a light novel, highly detailed, beautiful lighting, fantasy adventure style"],
+      "inputs": [{ "name": "clip", "type": "CLIP", "link": 2 }],
+      "outputs": [{ "name": "CONDITIONING", "type": "CONDITIONING", "links": [3] }]
+    },
+    {
+      "id": 4,
+      "type": "CLIPTextEncode",
+      "pos": [450, 220],
+      "size": { "0": 315, "1": 120 },
+      "widgets_values": ["low quality, blurry, deformed, text, watermark"],
+      "inputs": [{ "name": "clip", "type": "CLIP", "link": 2 }],
+      "outputs": [{ "name": "CONDITIONING", "type": "CONDITIONING", "links": [4] }]
+    },
+    {
+      "id": 5,
+      "type": "FluxGuidance",
+      "pos": [820, 60],
+      "size": { "0": 210, "1": 58 },
+      "widgets_values": [3.5],
+      "inputs": [{ "name": "model", "type": "MODEL", "link": 1 }],
+      "outputs": [{ "name": "MODEL", "type": "MODEL", "links": [5] }]
+    },
+    {
+      "id": 6,
+      "type": "EmptyLatentImage",
+      "pos": [820, 160],
+      "size": { "0": 210, "1": 106 },
+      "widgets_values": [1024, 1024, 1],
+      "outputs": [{ "name": "LATENT", "type": "LATENT", "links": [6] }]
+    },
+    {
+      "id": 7,
+      "type": "KSampler",
+      "pos": [1100, 60],
+      "size": { "0": 315, "1": 262 },
+      "widgets_values": [123456789, "fixed", 20, 1, "euler", "simple", 1],
+      "inputs": [
+        { "name": "model", "type": "MODEL", "link": 5 },
+        { "name": "positive", "type": "CONDITIONING", "link": 3 },
+        { "name": "negative", "type": "CONDITIONING", "link": 4 },
+        { "name": "latent_image", "type": "LATENT", "link": 6 }
+      ],
+      "outputs": [{ "name": "LATENT", "type": "LATENT", "links": [7] }]
+    },
+    {
+      "id": 8,
+      "type": "VAELoader",
+      "pos": [1100, 360],
+      "size": { "0": 315, "1": 58 },
+      "widgets_values": ["ae.safetensors"],
+      "outputs": [{ "name": "VAE", "type": "VAE", "links": [8] }]
+    },
+    {
+      "id": 9,
+      "type": "VAEDecode",
+      "pos": [1500, 60],
+      "size": { "0": 210, "1": 46 },
+      "inputs": [
+        { "name": "samples", "type": "LATENT", "link": 7 },
+        { "name": "vae", "type": "VAE", "link": 8 }
+      ],
+      "outputs": [{ "name": "IMAGE", "type": "IMAGE", "links": [9] }]
+    },
+    {
+      "id": 10,
+      "type": "SaveImage",
+      "pos": [1750, 60],
+      "size": { "0": 210, "1": 58 },
+      "inputs": [{ "name": "images", "type": "IMAGE", "link": 9 }],
+      "widgets_values": ["Flux_"]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 5, 0, "MODEL"],
+    [2, 2, 0, 3, 0, "CLIP"],
+    [3, 3, 0, 7, 1, "CONDITIONING"],
+    [4, 4, 0, 7, 2, "CONDITIONING"],
+    [5, 5, 0, 7, 0, "MODEL"],
+    [6, 6, 0, 7, 3, "LATENT"],
+    [7, 7, 0, 9, 0, "LATENT"],
+    [8, 8, 0, 9, 1, "VAE"],
+    [9, 9, 0, 10, 0, "IMAGE"]
+  ],
+  "version": 0.4
+}
