@@ -1072,7 +1072,7 @@ async def generate_with_grok_imagine(prompt: str, story_id: int, chapter_num: in
     output_dir = Path("generated_images")
     output_dir.mkdir(exist_ok=True)
 
-    # Choose model
+    # Choose model (latest high-quality model as of 2026)
     model = model or os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-quality")
 
     try:
@@ -1222,6 +1222,37 @@ async def test_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ 測試圖像已生成：{result}")
     else:
         await update.message.reply_text(f"圖像測試結果：\n{result}")
+
+
+async def test_grok_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test Grok Imagine image generation with real story context."""
+    story_id = context.user_data.get("current_story_id")
+    if not story_id:
+        await update.message.reply_text("請先載入一個故事（/loadstory <ID>）")
+        return
+
+    # Load latest chapter content
+    latest_content = ""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT content FROM chapters WHERE story_id = ? ORDER BY chapter_num DESC LIMIT 1", (story_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            latest_content = row[0] or ""
+    except Exception:
+        pass
+
+    if not latest_content:
+        latest_content = "主角站在月光下的古老寺廟前，風吹動他的長袍，眼神堅定。"
+
+    # Force Grok mode
+    result = await generate_image_for_chapter(latest_content, story_id, 99, update=update, mode="grok")
+    if result and result.startswith("/"):
+        await update.message.reply_text(f"✅ Grok Imagine 測試圖像已生成：{result}")
+    else:
+        await update.message.reply_text(f"Grok Imagine 測試結果：\n{result}")
 
 
 async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1448,8 +1479,26 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
+        # Load the latest chapter content so the image prompt has real story context
+        latest_chapter_content = ""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("""
+                SELECT content FROM chapters 
+                WHERE story_id = ? 
+                ORDER BY chapter_num DESC 
+                LIMIT 1
+            """, (story_id,))
+            row = c.fetchone()
+            conn.close()
+            if row:
+                latest_chapter_content = row[0] or ""
+        except Exception as e:
+            logger.warning(f"Failed to load latest chapter for image prompt: {e}")
+
         # Pass mode explicitly so we don't mutate the global IMAGE_MODE
-        temp_result = await generate_image_for_chapter("", story_id, 0, update=update, mode=image_mode)
+        temp_result = await generate_image_for_chapter(latest_chapter_content, story_id, 0, update=update, mode=image_mode)
 
         if temp_result and not temp_result.startswith("【"):
             try:
@@ -1500,6 +1549,7 @@ def main():
     app.add_handler(CommandHandler("image_mode", set_image_mode))
     app.add_handler(CommandHandler("test_guardrail", test_guardrail))
     app.add_handler(CommandHandler("test_image", test_image))
+    app.add_handler(CommandHandler("test_grok_image", test_grok_image))
     app.add_handler(CommandHandler("bug", handle_bug_report))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice))
 
