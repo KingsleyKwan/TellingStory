@@ -816,12 +816,33 @@ async def create_image_prompt(chapter_content: str) -> str:
     # 5. Take a reasonable length (first ~450 chars after cleaning)
     scene = text[:450].strip()
 
-    # 6. Build a clean, visual-focused prompt
+    # 6. If scene is too short or empty, use a safe generic prompt
+    if len(scene) < 30:
+        base = "cinematic scene from a light novel, mysterious atmosphere, detailed environment"
+    else:
+        base = f"cinematic scene from a light novel, {scene}"
+
     prompt = (
-        f"cinematic scene from a light novel, {scene}, "
-        "highly detailed, beautiful lighting, expressive character faces, "
+        f"{base}, highly detailed, beautiful lighting, expressive character faces, "
         "atmospheric, fantasy adventure style, sharp focus, 8k"
     )
+
+    # 7. Apply story style if available
+    if story_id:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT image_style, image_style_prompt FROM stories WHERE story_id = ?", (story_id,))
+            row = c.fetchone()
+            conn.close()
+            if row:
+                style, expanded = row[0], row[1]
+                if expanded:
+                    prompt = f"{prompt}, {expanded}"
+                elif style and style.lower() != "real":
+                    prompt = f"{prompt}, in the style of {style}"
+        except Exception:
+            pass
 
     return prompt
 
@@ -1246,7 +1267,7 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
 
     # Fallback if optimizer failed or returned nothing
     if not prompt:
-        prompt = await create_image_prompt(chapter_content)
+        prompt = await create_image_prompt(chapter_content, story_id)
         logger.info("Using fallback simple image prompt (optimizer failed or disabled)")
 
     # Inject per-story image style into the prompt (prefer expanded prompt if available)
