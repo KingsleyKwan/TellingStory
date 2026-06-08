@@ -1206,12 +1206,14 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
     """
     # Prompt optimization (recommended for better image quality)
     use_optimizer = os.getenv("USE_IMAGE_PROMPT_OPTIMIZER", "true").lower() == "true"
+    prompt = None
     if use_optimizer:
         prompt = await optimize_image_prompt(chapter_content, story_id)
-        logger.info("Using optimized image prompt")
-    else:
+
+    # Fallback if optimizer failed or returned nothing
+    if not prompt:
         prompt = await create_image_prompt(chapter_content)
-        logger.info("Using simple image prompt (optimizer disabled)")
+        logger.info("Using fallback simple image prompt (optimizer failed or disabled)")
 
     # Inject per-story image style into the prompt (prefer expanded prompt if available)
     try:
