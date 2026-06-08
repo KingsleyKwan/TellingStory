@@ -963,7 +963,8 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, pr
         # === Inject runtime values (works for both API and converted workflows) ===
         if "3" in workflow:
             workflow["3"]["inputs"]["text"] = prompt
-            log(f"[{ts()}] 已注入正向 prompt 到 node 3")
+            log(f"[{ts()}] 已注入正向 prompt 到 node 3: {prompt[:150]}...")
+            logger.info(f"[COMFYUI NODE 3 PROMPT] {prompt}")
 
         if "10" in workflow:
             workflow["10"]["inputs"]["filename_prefix"] = f"story_{story_id}_ch{chapter_num}_"
@@ -1143,10 +1144,7 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
         prompt = await create_image_prompt(chapter_content)
         logger.info("Using simple image prompt (optimizer disabled)")
 
-    # === DEBUG LOG: show exactly what prompt is sent to the image generator ===
-    logger.info(f"[FINAL IMAGE PROMPT] {prompt}")
-
-    # Inject per-story image style into the prompt
+    # Inject per-story image style into the prompt (before logging)
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -1159,6 +1157,9 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
             logger.info(f"Applied story image_style: {style}")
     except Exception as e:
         logger.warning(f"Failed to load image_style for story {story_id}: {e}")
+
+    # === DEBUG LOG: show exactly what prompt is sent to the image generator ===
+    logger.info(f"[FINAL IMAGE PROMPT] {prompt}")
 
     effective_mode = mode or IMAGE_MODE
 
