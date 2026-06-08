@@ -80,7 +80,8 @@ def init_db():
         title TEXT,
         story_bible TEXT,
         current_chapter INTEGER DEFAULT 1,
-        created_at TEXT
+        created_at TEXT,
+        image_style TEXT DEFAULT 'real'
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS chapters (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +91,12 @@ def init_db():
         choice_made TEXT,
         created_at TEXT
     )''')
+    # Migration for existing databases
+    try:
+        c.execute("ALTER TABLE stories ADD COLUMN image_style TEXT DEFAULT 'real'")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     c.execute('''CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         story_id INTEGER,
@@ -702,6 +709,7 @@ async def new_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["current_story_id"] = story_id
     context.user_data["initial_prompt"] = prompt
+    context.user_data["awaiting_image_style_for"] = story_id   # ask for style next
 
     chapter1, _ = generate_chapter(story_id, initial_prompt=prompt, is_first=True)
 
@@ -709,9 +717,9 @@ async def new_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["last_choices"] = parse_choices(chapter1)
 
     await update.message.reply_text(
-        f"✅ 新故事已建立！Story ID: `{story_id}`\n"
-        f"以後可以用 `/loadstory {story_id}` 繼續這個故事。\n\n"
-        f"{chapter1}"
+        f"✅ 新故事已建立！Story ID: `{story_id}`\n\n"
+        f"{chapter1}\n\n"
+        "請回覆你想要的**圖像風格**（例如：real、SAO、某某畫家、某某作品），或輸入 /skip 使用預設 real。"
     )
 
 
@@ -1138,6 +1146,20 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
     # === DEBUG LOG: show exactly what prompt is sent to the image generator ===
     logger.info(f"[FINAL IMAGE PROMPT] {prompt}")
 
+    # Inject per-story image style into the prompt
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT image_style FROM stories WHERE story_id = ?", (story_id,))
+        row = c.fetchone()
+        conn.close()
+        style = row[0] if row and row[0] else "real"
+        if style and style.lower() != "real":
+            prompt = f"{prompt}, in the style of {style}"
+            logger.info(f"Applied story image_style: {style}")
+    except Exception as e:
+        logger.warning(f"Failed to load image_style for story {story_id}: {e}")
+
     effective_mode = mode or IMAGE_MODE
 
     if effective_mode == "comfyui":
@@ -1202,6 +1224,38 @@ async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.environ["GROK_IMAGE_MODEL"] = "grok-imagine-image-quality"  # default to quality
 
     await update.message.reply_text(f"✅ 圖像生成模式已切換為：{mode}")
+
+
+async def set_story_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set image style for the current or specified story."""
+    story_id = context.user_data.get("current_story_id")
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(
+            "用法：`/setstyle <風格>`（需先 `/loadstory`）\n"
+            "或 `/setstyle <故事ID> <風格>`\n"
+            "例如：`/setstyle SAO` 或 `/setstyle 12 某某畫家`"
+        )
+        return
+
+    if len(args) == 1 and story_id:
+        style = args[0]
+        target_story = story_id
+    elif len(args) == 2 and args[0].isdigit():
+        target_story = int(args[0])
+        style = args[1]
+    else:
+        await update.message.reply_text("參數錯誤。請使用 `/setstyle <風格>` 或 `/setstyle <ID> <風格>`")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE stories SET image_style = ? WHERE story_id = ?", (style, target_story))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"✅ 故事 {target_story} 的圖像風格已設為：`{style}`")
 
 
 async def test_guardrail(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1444,6 +1498,19 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     story_id = context.user_data.get("current_story_id")
 
+    # Handle pending image style setting (after /newstory or /setstyle)
+    pending_story = context.user_data.get("awaiting_image_style_for")
+    if pending_story and not text.startswith("/") and not text.upper() in ["A","B","C","D","E","I","G"]:
+        style = text.strip()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE stories SET image_style = ? WHERE story_id = ?", (style, pending_story))
+        conn.commit()
+        conn.close()
+        context.user_data.pop("awaiting_image_style_for", None)
+        await update.message.reply_text(f"✅ 已將故事 {pending_story} 的圖像風格設為：`{style}`\n\n請繼續選擇下一步（A/B/C/D/E/I/G）。")
+        return
+
     if not story_id:
         await update.message.reply_text(
             "你的對話 session 已過期或尚未載入故事。\n"
@@ -1551,6 +1618,7 @@ def main():
     app.add_handler(CommandHandler("mystories", list_my_stories))
     app.add_handler(CommandHandler("loadstory", load_story))
     app.add_handler(CommandHandler("image_mode", set_image_mode))
+    app.add_handler(CommandHandler("setstyle", set_story_style))
     app.add_handler(CommandHandler("test_guardrail", test_guardrail))
     app.add_handler(CommandHandler("test_image", test_image))
     app.add_handler(CommandHandler("test_grok_image", test_grok_image))
