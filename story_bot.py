@@ -828,23 +828,6 @@ async def create_image_prompt(chapter_content: str, story_id: int = None) -> str
         "atmospheric, fantasy adventure style, sharp focus, 8k"
     )
 
-    # 7. Apply story style if available
-    if story_id:
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("SELECT image_style, image_style_prompt FROM stories WHERE story_id = ?", (story_id,))
-            row = c.fetchone()
-            conn.close()
-            if row:
-                style, expanded = row[0], row[1]
-                if expanded:
-                    prompt = f"{prompt}, {expanded}"
-                elif style and style.lower() != "real":
-                    prompt = f"{prompt}, in the style of {style}"
-        except Exception:
-            pass
-
     return prompt
 
 
