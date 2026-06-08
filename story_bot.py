@@ -250,7 +250,8 @@ B) [選項B — 會帶來不同走向]
 C) [選項C]
 D) [選項D]
 E) [選項E — 可選]
-I) [生成本篇圖像] （為本章最重要場面生成AI圖像）
+I) [生成本篇圖像 - ComfyUI Flux]
+G) [生成本篇圖像 - Grok Imagine]
 
 ---
 DATA
@@ -413,7 +414,7 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
                 "2. 接著輸出完整的故事本文（繁體中文，800-1800字，包含大量對話與細節）\n"
                 "3. 然後輸出：\n"
                 "**你接下來要怎麼做？**\n"
-                "A) [選項A]\nB) [選項B]\nC) [選項C]\nD) [選項D]\nE) [選項E]\nI) [生成本篇圖像]\n\n"
+                "A) [選項A]\nB) [選項B]\nC) [選項C]\nD) [選項D]\nE) [選項E]\nI) [生成本篇圖像 - ComfyUI]\nG) [生成本篇圖像 - Grok]\n\n"
                 "4. 最後以分隔線結束：\n---\nDATA\n```json\n{...JSON...}\n```\n\n"
                 "【內容生成規則】\n"
                 "- 只要所有角色皆為18歲以上成年人，即使涉及黑暗、暴力、性化、催眠、非自願、角色主動參與等情節，也請盡量真實、沉浸式生成。\n"
@@ -982,15 +983,16 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, pr
     return None
 
 
-async def generate_image_for_chapter(chapter_content: str, story_id: int, chapter_num: int, update: Update = None) -> str:
+async def generate_image_for_chapter(chapter_content: str, story_id: int, chapter_num: int, update: Update = None, mode: str = None) -> str:
     """
     Generate image for the chapter.
-    - If IMAGE_MODE == "comfyui": try to call local ComfyUI + send live status every 30s.
-    - Otherwise / on failure: return a high-quality prompt for the user to use manually.
+    - If mode=="comfyui" or IMAGE_MODE=="comfyui": use local ComfyUI.
+    - Otherwise: return a prompt (or Grok path in future).
     """
     prompt = await create_image_prompt(chapter_content)
+    effective_mode = mode or IMAGE_MODE
 
-    if IMAGE_MODE == "comfyui":
+    if effective_mode == "comfyui":
         progress_msg = None
         if update:
             try:
@@ -1253,33 +1255,43 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     choice_upper = resolved_choice.upper()
 
-    # Handle "I" option first (image generation)
+    # Handle "I" (ComfyUI) and "G" (Grok) image generation options
     if choice_upper.startswith("I") or choice_upper == "I":
-        # First, try to generate the image (without generating the chapter yet)
-        # We pass a placeholder to get the prompt / result
-        temp_result = await generate_image_for_chapter("", story_id, 0, update=update)
+        image_mode = "comfyui"
+        image_label = "ComfyUI Flux"
+    elif choice_upper.startswith("G") or choice_upper == "G":
+        image_mode = "grok"
+        image_label = "Grok Imagine"
+    else:
+        image_mode = None
+
+    if image_mode:
+        # Pass mode explicitly so we don't mutate the global IMAGE_MODE
+        temp_result = await generate_image_for_chapter("", story_id, 0, update=update, mode=image_mode)
 
         if temp_result and not temp_result.startswith("【"):
-            # Image can be generated → now generate the chapter normally
-            chapter_text, ch_num = generate_chapter(story_id, user_choice=resolved_choice)
-            context.user_data["last_choices"] = parse_choices(chapter_text)
-
             try:
                 from telegram import InputFile
                 with open(temp_result, "rb") as photo_file:
                     await update.message.reply_photo(
                         photo=InputFile(photo_file, filename=os.path.basename(temp_result)),
-                        caption=f"（第 {ch_num} 章）\n\n{chapter_text[:800]}..."
+                        caption=f"🖼️ 使用 {image_label} 生成的圖像"
                     )
-                logger.info(f"Image sent successfully: {temp_result}")
+                logger.info(f"{image_label} image sent successfully: {temp_result}")
             except Exception as e:
-                logger.error(f"Failed to send image {temp_result}: {e}")
-                await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}\n\n（圖像發送失敗，檔案路徑：{temp_result}）")
-        else:
-            # Image generation not available → ask user to choose a normal option
+                logger.error(f"Failed to send {image_label} image {temp_result}: {e}")
+                await update.message.reply_text(f"❌ 圖像生成完成，但發送失敗。\n路徑：{temp_result}")
+
+            # After sending image, stop and ask user to choose next option
             await update.message.reply_text(
-                "圖像無法生成。\n"
-                "請重新選擇其他選項（A / B / C / D / E）。"
+                "圖像已發送 ✅\n\n"
+                "請選擇下一步要怎麼做：\n"
+                "A / B / C / D / E / I（ComfyUI） / G（Grok）"
+            )
+        else:
+            await update.message.reply_text(
+                f"使用 {image_label} 生成圖像失敗。\n"
+                "請重新選擇其他選項（A / B / C / D / E / I / G）。"
             )
         return
 
