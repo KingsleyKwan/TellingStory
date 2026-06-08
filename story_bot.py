@@ -783,13 +783,41 @@ async def load_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ====================== IMAGE GENERATION ======================
 
 async def create_image_prompt(chapter_content: str) -> str:
-    """Fallback simple prompt (used when optimizer is disabled)."""
-    scene = chapter_content[:600].replace('\n', ' ').strip()
-    return (
+    """
+    Smart fallback prompt generator.
+    Cleans raw chapter text and extracts visual elements only.
+    """
+    import re
+
+    text = chapter_content
+
+    # 1. Remove chapter titles like **第 29 章：【村裡的隱秘日常】**
+    text = re.sub(r'\*\*第\s*\d+\s*章[：:：].*?\*\*', '', text)
+
+    # 2. Remove lines that look like dialogue (containing 「」 or "「")
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        if '「' in line or '」' in line:
+            continue  # skip dialogue lines
+        cleaned_lines.append(line)
+    text = ' '.join(cleaned_lines)
+
+    # 3. Remove excessive punctuation and normalize whitespace
+    text = re.sub(r'[「」『』【】《》]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    # 4. Take a reasonable length (first ~450 chars after cleaning)
+    scene = text[:450].strip()
+
+    # 5. Build a clean, visual-focused prompt
+    prompt = (
         f"cinematic scene from a light novel, {scene}, "
         "highly detailed, beautiful lighting, expressive character faces, "
         "atmospheric, fantasy adventure style, sharp focus, 8k"
     )
+
+    return prompt
 
 
 async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
