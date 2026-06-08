@@ -781,61 +781,99 @@ async def create_image_prompt(chapter_content: str) -> str:
     return prompt
 
 
-async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int) -> str:
-    """Generate image using the user's tuned Flux GGUF workflow (flux_workflow.json)."""
+async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, progress_message=None) -> str:
+    """
+    Generate image using the user's tuned Flux GGUF workflow (flux_workflow.json).
+    - progress_message: optional Telegram message to edit with live status every 30s.
+    """
     import aiohttp
     import json
+    import random
+    import time
     from pathlib import Path
+    from datetime import datetime
 
+    start_time = time.time()
     output_dir = Path("generated_images")
     output_dir.mkdir(exist_ok=True)
     workflow_path = BASE_DIR / "generated_images" / "flux_workflow.json"
 
+    def ts():
+        return datetime.now().strftime("%H:%M:%S")
+
+    def log(msg):
+        logger.info(f"[{ts()}] {msg}")
+
+    log(f"開始 ComfyUI Flux 生成 | story={story_id} chapter={chapter_num}")
+
     try:
+        log(f"載入 workflow: {workflow_path}")
         with open(workflow_path, "r", encoding="utf-8") as f:
             workflow = json.load(f)
+        log("workflow JSON 載入成功")
 
-        # Inject positive prompt into node 3 (CLIPTextEncode for positive conditioning)
-        # The user's workflow has node 3 as the positive prompt node
-        if "3" in workflow.get("nodes", []):  # safety for list form, but our JSON uses dict keys in "nodes" wait, actually top-level nodes array
-            pass  # our JSON stores nodes as list; we need to find by id
-
-        # The saved JSON uses a list under "nodes". Find node id==3
+        # Inject positive prompt into node 3
         for node in workflow.get("nodes", []):
             if node.get("id") == 3 and node.get("type") == "CLIPTextEncode":
-                # widgets_values[0] holds the prompt text in ComfyUI JSON exports
                 if "widgets_values" in node and len(node["widgets_values"]) > 0:
                     node["widgets_values"][0] = prompt
+                log(f"[{ts()}] 已注入正向 prompt 到 node 3")
                 break
 
         # Update SaveImage filename prefix (node 10)
         for node in workflow.get("nodes", []):
             if node.get("id") == 10 and node.get("type") == "SaveImage":
                 node["widgets_values"] = [f"story_{story_id}_ch{chapter_num}_"]
+                log(f"[{ts()}] 已更新 SaveImage 檔名前綴")
                 break
 
-        # Optional: randomize seed in KSampler (node 7) for variety
-        import random
+        # Randomize seed
         for node in workflow.get("nodes", []):
             if node.get("id") == 7 and node.get("type") == "KSampler":
                 if "widgets_values" in node and len(node["widgets_values"]) > 0:
                     node["widgets_values"][0] = random.randint(1, 2**31 - 1)
+                log(f"[{ts()}] 已隨機化 KSampler seed")
                 break
 
-        async with aiohttp.ClientSession() as session:
+        log(f"[{ts()}] 準備 POST 到 ComfyUI: {COMFYUI_URL}/prompt")
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow}) as resp:
+                log(f"[{ts()}] ComfyUI 回應狀態碼: {resp.status}")
                 if resp.status != 200:
-                    logger.error(f"ComfyUI returned status {resp.status}")
+                    logger.error(f"[{ts()}] ComfyUI returned status {resp.status}")
                     return None
 
                 result = await resp.json()
                 prompt_id = result.get("prompt_id")
                 if not prompt_id:
+                    log(f"[{ts()}] 沒有收到 prompt_id，結束")
                     return None
 
-                # Poll history up to ~60s
-                for _ in range(30):
-                    await asyncio.sleep(2)
+                log(f"[{ts()}] 取得 prompt_id = {prompt_id}，開始輪詢 history...")
+
+                max_wait_seconds = 600  # 10 分鐘
+                poll_interval = 2
+                heartbeat_interval = 30  # 每 30 秒更新 Telegram
+                last_heartbeat = time.time()
+
+                for i in range(max_wait_seconds // poll_interval):
+                    await asyncio.sleep(poll_interval)
+                    elapsed = int(time.time() - start_time)
+
+                    # Telegram heartbeat every 30s
+                    if progress_message and (time.time() - last_heartbeat >= heartbeat_interval):
+                        status = "正常" if elapsed < 300 else "可能卡住"
+                        try:
+                            await progress_message.edit_text(
+                                f"🖼️ 正在使用 ComfyUI Flux 生成圖像...\n"
+                                f"已等待 {elapsed}s | 狀態：{status}\n"
+                                f"prompt_id: {prompt_id}"
+                            )
+                            last_heartbeat = time.time()
+                            log(f"[{ts()}] 已更新 Telegram 狀態 (elapsed={elapsed}s)")
+                        except Exception as edit_err:
+                            logger.warning(f"[{ts()}] 無法編輯 Telegram 訊息: {edit_err}")
+
                     async with session.get(f"{COMFYUI_URL}/history/{prompt_id}") as hist_resp:
                         history = await hist_resp.json()
                         if prompt_id in history:
@@ -844,27 +882,45 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int) ->
                                 if "images" in node_output and node_output["images"]:
                                     filename = node_output["images"][0]["filename"]
                                     image_path = output_dir / filename
-                                    logger.info(f"Flux image saved: {image_path}")
+                                    log(f"[{ts()}] ✅ Flux 圖像已生成: {image_path} (總耗時 {elapsed}s)")
+                                    if progress_message:
+                                        try:
+                                            await progress_message.edit_text(f"✅ 圖像生成完成！(耗時 {elapsed}s)")
+                                        except:
+                                            pass
                                     return str(image_path)
+
+                    if i % 15 == 0:
+                        log(f"[{ts()}] 仍在輪詢... elapsed={elapsed}s")
+
     except Exception as e:
+        log(f"[{ts()}] ComfyUI Flux generation 發生例外: {e}")
         logger.error(f"ComfyUI Flux generation failed: {e}")
         return None
 
+    log(f"[{ts()}] 超時 ({max_wait_seconds}s) 仍未完成，結束")
     return None
 
 
-async def generate_image_for_chapter(chapter_content: str, story_id: int, chapter_num: int) -> str:
+async def generate_image_for_chapter(chapter_content: str, story_id: int, chapter_num: int, update: Update = None) -> str:
     """
     Generate image for the chapter.
-    - If IMAGE_MODE == "comfyui": try to call local ComfyUI.
+    - If IMAGE_MODE == "comfyui": try to call local ComfyUI + send live status every 30s.
     - Otherwise / on failure: return a high-quality prompt for the user to use manually.
     """
     prompt = await create_image_prompt(chapter_content)
 
     if IMAGE_MODE == "comfyui":
+        progress_msg = None
+        if update:
+            try:
+                progress_msg = await update.message.reply_text("🖼️ 正在使用 ComfyUI Flux 生成圖像... (已等待 0s)")
+            except Exception as e:
+                logger.warning(f"無法發送進度訊息: {e}")
+
         # Try real ComfyUI generation
         try:
-            image_path = await generate_with_comfyui(prompt, story_id, chapter_num)
+            image_path = await generate_with_comfyui(prompt, story_id, chapter_num, progress_message=progress_msg)
             if image_path:
                 return image_path
         except Exception as e:
@@ -905,7 +961,7 @@ async def test_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("請先載入一個故事（/loadstory <ID>）")
         return
     sample_text = "主角站在月光下的古老寺廟前，風吹動他的長袍，眼神堅定。"
-    result = await generate_image_for_chapter(sample_text, story_id, 99)
+    result = await generate_image_for_chapter(sample_text, story_id, 99, update=update)
     if result and result.startswith("/"):
         await update.message.reply_text(f"✅ 測試圖像已生成：{result}")
     else:
@@ -1117,7 +1173,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if choice_upper.startswith("I") or choice_upper == "I":
         # First, try to generate the image (without generating the chapter yet)
         # We pass a placeholder to get the prompt / result
-        temp_result = await generate_image_for_chapter("", story_id, 0)
+        temp_result = await generate_image_for_chapter("", story_id, 0, update=update)
 
         if temp_result and not temp_result.startswith("【"):
             # Image can be generated → now generate the chapter normally
