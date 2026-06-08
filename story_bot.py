@@ -809,31 +809,89 @@ async def generate_with_comfyui(prompt: str, story_id: int, chapter_num: int, pr
     try:
         log(f"載入 workflow: {workflow_path}")
         with open(workflow_path, "r", encoding="utf-8") as f:
-            workflow = json.load(f)
+            ui_workflow = json.load(f)
         log("workflow JSON 載入成功")
 
-        # Inject positive prompt into node 3
-        for node in workflow.get("nodes", []):
-            if node.get("id") == 3 and node.get("type") == "CLIPTextEncode":
-                if "widgets_values" in node and len(node["widgets_values"]) > 0:
-                    node["widgets_values"][0] = prompt
-                log(f"[{ts()}] 已注入正向 prompt 到 node 3")
-                break
+        # Convert UI-format workflow (with "nodes" array) to API prompt format
+        def convert_ui_workflow_to_api_prompt(ui_wf: dict) -> dict:
+            prompt = {}
+            node_list = ui_wf.get("nodes", [])
+            for node in node_list:
+                node_id = str(node.get("id"))
+                node_type = node.get("type")
+                widgets = node.get("widgets_values", [])
+                node_inputs = node.get("inputs", [])
 
-        # Update SaveImage filename prefix (node 10)
-        for node in workflow.get("nodes", []):
-            if node.get("id") == 10 and node.get("type") == "SaveImage":
-                node["widgets_values"] = [f"story_{story_id}_ch{chapter_num}_"]
-                log(f"[{ts()}] 已更新 SaveImage 檔名前綴")
-                break
+                # Build inputs dict from UI connections + widget values
+                inputs = {}
+                # Map widget values to known input names for common nodes
+                if node_type == "CLIPTextEncode" and len(widgets) > 0:
+                    inputs["text"] = widgets[0]
+                if node_type == "KSampler" and len(widgets) >= 7:
+                    inputs.update({
+                        "seed": widgets[0],
+                        "control_after_generate": widgets[1],
+                        "steps": widgets[2],
+                        "cfg": widgets[3],
+                        "sampler_name": widgets[4],
+                        "scheduler": widgets[5],
+                        "denoise": widgets[6],
+                    })
+                if node_type == "EmptyLatentImage" and len(widgets) >= 3:
+                    inputs.update({"width": widgets[0], "height": widgets[1], "batch_size": widgets[2]})
+                if node_type == "SaveImage" and len(widgets) > 0:
+                    inputs["filename_prefix"] = widgets[0]
+                if node_type == "VAELoader" and len(widgets) > 0:
+                    inputs["vae_name"] = widgets[0]
+                if node_type == "UnetLoaderGGUF" and len(widgets) > 0:
+                    inputs["unet_name"] = widgets[0]
+                    if len(widgets) > 1:
+                        inputs["weight_dtype"] = widgets[1]
+                if node_type == "DualCLIPLoaderGGUF" and len(widgets) >= 3:
+                    inputs.update({
+                        "clip_name1": widgets[0],
+                        "clip_name2": widgets[1],
+                        "type": widgets[2],
+                    })
+                if node_type == "FluxGuidance" and len(widgets) > 0:
+                    inputs["guidance"] = widgets[0]
 
-        # Randomize seed
-        for node in workflow.get("nodes", []):
-            if node.get("id") == 7 and node.get("type") == "KSampler":
-                if "widgets_values" in node and len(node["widgets_values"]) > 0:
-                    node["widgets_values"][0] = random.randint(1, 2**31 - 1)
-                log(f"[{ts()}] 已隨機化 KSampler seed")
-                break
+                # Add connections from "inputs" array
+                for inp in node_inputs:
+                    link = inp.get("link")
+                    if link is not None:
+                        # Find the source node for this link
+                        for link_def in ui_wf.get("links", []):
+                            if link_def[0] == link:
+                                src_node = str(link_def[1])
+                                src_slot = link_def[2]
+                                inputs[inp["name"]] = [src_node, src_slot]
+                                break
+
+                prompt[node_id] = {
+                    "class_type": node_type,
+                    "inputs": inputs
+                }
+            return prompt
+
+        workflow = convert_ui_workflow_to_api_prompt(ui_workflow)
+        log(f"已轉換為 API prompt 格式，節點數: {len(workflow)}")
+
+        # === Inject runtime values into the converted API prompt ===
+        # Node 3 = positive CLIPTextEncode
+        if "3" in workflow:
+            workflow["3"]["inputs"]["text"] = prompt
+            log(f"[{ts()}] 已注入正向 prompt 到 node 3")
+
+        # Node 10 = SaveImage
+        if "10" in workflow:
+            workflow["10"]["inputs"]["filename_prefix"] = f"story_{story_id}_ch{chapter_num}_"
+            log(f"[{ts()}] 已更新 SaveImage 檔名前綴")
+
+        # Node 7 = KSampler → randomize seed
+        if "7" in workflow:
+            workflow["7"]["inputs"]["seed"] = random.randint(1, 2**31 - 1)
+            log(f"[{ts()}] 已隨機化 KSampler seed")
 
         log(f"[{ts()}] 準備 POST 到 ComfyUI: {COMFYUI_URL}/prompt")
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
