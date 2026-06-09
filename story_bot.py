@@ -108,6 +108,10 @@ def init_db():
         c.execute("ALTER TABLE stories ADD COLUMN image_style_prompt TEXT")
     except sqlite3.OperationalError:
         pass
+    try:
+        c.execute("ALTER TABLE stories ADD COLUMN style_ref_images TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     c.execute('''CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,6 +144,16 @@ def init_db():
             UNIQUE(story_id, name)
         )
     ''')
+
+    # v3.1 - Character reference image columns (for face/outlook consistency)
+    try:
+        c.execute("ALTER TABLE characters ADD COLUMN reference_image_path TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE characters ADD COLUMN face_lock_prompt TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS character_relationships (
@@ -177,7 +191,14 @@ def load_story_context(story_id: int) -> dict:
     c.execute("SELECT story_bible, current_chapter FROM stories WHERE story_id = ?", (story_id,))
     row = c.fetchone()
     story_bible = row[0] if row else "{}"
-    current_chapter = row[1] if row else 1
+    stored_current = row[1] if row else 1
+
+    # Compute the real current chapter from actual chapter records (defensive against desync)
+    c.execute("SELECT COALESCE(MAX(chapter_num), 0) FROM chapters WHERE story_id = ?", (story_id,))
+    actual_max = c.fetchone()[0] or 0
+    current_chapter = max(stored_current, actual_max)
+    if current_chapter > stored_current:
+        logger.warning(f"Corrected current_chapter for story {story_id}: stored={stored_current} → actual={current_chapter}")
 
     c.execute("""SELECT chapter_num, content, choice_made 
                  FROM chapters WHERE story_id = ? 
@@ -671,6 +692,21 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
                         ))
                     logger.info(f"Synced {len(char_data)} characters for story {story_id}")
 
+                    # Auto-generate character reference images for new characters (face/outlook consistency)
+                    if grok_client:
+                        for name, info in char_data.items():
+                            try:
+                                c.execute("SELECT reference_image_path FROM characters WHERE story_id = ? AND name = ?", (story_id, name))
+                                existing = c.fetchone()
+                                if existing and existing[0]:
+                                    continue  # already has reference
+
+                                traits = info.get("appearance") or info.get("traits") or ""
+                                # Run async generation in background (non-blocking)
+                                asyncio.create_task(_generate_and_store_character_ref(name, traits, story_id, c))
+                            except Exception as e:
+                                logger.warning(f"Character reference scheduling failed for {name}: {e}")
+
                 # Insert / Update relationships
                 if rel_data:
                     if isinstance(rel_data, dict):
@@ -774,17 +810,13 @@ async def new_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["current_story_id"] = story_id
     context.user_data["initial_prompt"] = prompt
-    context.user_data["awaiting_image_style_for"] = story_id   # ask for style next
-
-    chapter1, _ = generate_chapter(story_id, initial_prompt=prompt, is_first=True)
-
-    # Parse and store choices for future letter resolution
-    context.user_data["last_choices"] = parse_choices(chapter1)
+    context.user_data["awaiting_image_style_for"] = story_id   # ask for style first
 
     await update.message.reply_text(
         f"✅ 新故事已建立！Story ID: `{story_id}`\n\n"
-        f"{chapter1}\n\n"
-        "請回覆你想要的**圖像風格**（例如：real、SAO、某某畫家、某某作品），或輸入 /skip 使用預設 real。"
+        f"請先回覆你想要的**圖像風格**（例如：real、SAO、某某畫家、某某作品），\n"
+        f"或輸入 `/skip` 使用預設 real。\n\n"
+        f"設定風格後，系統會生成第 1 章。"
     )
 
 
@@ -833,11 +865,45 @@ async def load_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["current_story_id"] = story_id
-    context.user_data.pop("last_choices", None)  # reset choices when switching stories
-    await update.message.reply_text(
-        f"✅ 已載入 Story ID `{story_id}`！\n"
-        f"現在可以直接輸入 A / B / C / D / E / I 繼續故事。"
-    )
+
+    # Load latest chapter so user sees where they left off + available choices
+    latest_chapter = None
+    latest_ch_num = 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            SELECT chapter_num, content FROM chapters
+            WHERE story_id = ?
+            ORDER BY chapter_num DESC LIMIT 1
+        """, (story_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            latest_ch_num, latest_chapter = row
+            context.user_data["last_choices"] = parse_choices(latest_chapter or "")
+    except Exception as e:
+        logger.warning(f"Failed to load latest chapter on /loadstory: {e}")
+
+    if latest_chapter:
+        # Send the last chapter so user knows the current situation and choices
+        header = f"📖 **Story {story_id} — 第 {latest_ch_num} 章（最新）**\n\n"
+        # Telegram has ~4096 char limit; send full if possible, otherwise note it
+        if len(latest_chapter) > 3800:
+            preview = latest_chapter[:3500] + "\n\n...（章節較長，已截斷，完整內容請參考先前對話）"
+            await update.message.reply_text(header + preview)
+        else:
+            await update.message.reply_text(header + latest_chapter)
+        await update.message.reply_text(
+            "請輸入 A / B / C / D / E / I / G 選擇下一步（或輸入完整選項文字）。"
+        )
+    else:
+        context.user_data.pop("last_choices", None)
+        await update.message.reply_text(
+            f"✅ 已載入 Story ID `{story_id}`！\n"
+            f"（此故事尚無章節）\n"
+            f"現在可以直接輸入 A / B / C / D / E / I 繼續故事。"
+        )
 
 
 # ====================== IMAGE GENERATION ======================
@@ -1343,22 +1409,75 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
     except Exception as e:
         logger.warning(f"Failed to load image_style for story {story_id}: {e}")
 
+    # Inject character face_lock_prompts for consistency (if any characters have references)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            SELECT name, face_lock_prompt FROM characters 
+            WHERE story_id = ? AND face_lock_prompt IS NOT NULL
+        """, (story_id,))
+        char_refs = c.fetchall()
+        conn.close()
+
+        if char_refs:
+            face_locks = "; ".join([f"{row[1]}" for row in char_refs])
+            prompt = f"{prompt}, character consistency: {face_locks}"
+            logger.info(f"Applied {len(char_refs)} character face lock(s)")
+    except Exception as e:
+        logger.warning(f"Failed to load character face locks: {e}")
+
     # === DEBUG LOG: show exactly what prompt is sent to the image generator ===
     logger.info(f"[FINAL IMAGE PROMPT] {prompt}")
 
     effective_mode = mode or IMAGE_MODE
 
-    if effective_mode == "comfyui":
-        progress_msg = None
-        if update:
-            try:
-                progress_msg = await update.message.reply_text(
-                    "🖼️ 正在使用 ComfyUI Flux 生成圖像...\n"
-                    "預計時間：4-7 分鐘（視硬件而定）\n"
-                    "每 30 秒更新一次狀態"
+
+async def _download_style_refs_background(style: str, story_id: int):
+    """Background task to download style reference images without blocking the user."""
+    try:
+        await download_style_references(style, story_id)
+    except Exception as e:
+        logger.warning(f"Background style reference download failed: {e}")
+
+
+async def _background_generate_chapter_image(story_id: int, chapter_num: int, chapter_content: str, chat_id: int, bot):
+    """
+    Non-blocking background task.
+    Generates chapter illustration using local ComfyUI and sends it to the user.
+    The image filename includes story_id and chapter_num.
+    User can continue interacting while this runs.
+    """
+    try:
+        # Always use comfyui for automatic chapter images
+        image_path = await generate_image_for_chapter(
+            chapter_content, story_id, chapter_num, mode="comfyui"
+        )
+
+        if image_path and not image_path.startswith("【"):
+            from telegram import InputFile
+            with open(image_path, "rb") as f:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=InputFile(f, filename=os.path.basename(image_path)),
+                    caption=f"🖼️ Story {story_id} · 第 {chapter_num} 章 插圖",
+                    read_timeout=120,
+                    write_timeout=120
                 )
-            except Exception as e:
-                logger.warning(f"無法發送進度訊息: {e}")
+            logger.info(f"[Background] Chapter image sent: story={story_id} ch={chapter_num}")
+        else:
+            # Generation failed or returned error string — notify user
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ 第 {chapter_num} 章插圖生成失敗（ComfyUI 可能未啟動或發生錯誤）。\n你可以手動輸入 I 來重試。"
+            )
+            logger.warning(f"[Background] Chapter image generation failed for story={story_id} ch={chapter_num}")
+    except Exception as e:
+        logger.error(f"[Background] Chapter image generation error (story {story_id} ch {chapter_num}): {e}")
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"⚠️ 第 {chapter_num} 章插圖生成時發生錯誤。")
+        except:
+            pass
 
         # Try real ComfyUI generation
         try:
@@ -1381,7 +1500,9 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
         except Exception as e:
             logger.error(f"Grok Imagine generation error: {e}")
 
-        return f"【圖像生成失敗】\nGrok Imagine 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
+        # Safe fallback error message (prompt may not be defined in all call paths)
+        safe_prompt = prompt if 'prompt' in locals() else chapter_content[:300] + "..."
+        return f"【圖像生成失敗】\nGrok Imagine 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{safe_prompt}"
 
 
 async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1452,6 +1573,140 @@ async def set_story_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ 故事 {target_story} 的圖像風格已設為：`{style}`\n"
         f"已自動擴展為詳細描述（供本地模型使用）。"
     )
+
+    # Auto-download style reference images from DuckDuckGo
+    try:
+        ref_paths = await download_style_references(style, target_story)
+        if ref_paths:
+            await update.message.reply_text(
+                f"已自動下載 {len(ref_paths)} 張風格參考圖（存於 generated_images/style_refs/{target_story}/）"
+            )
+    except Exception as e:
+        logger.warning(f"Style reference download failed: {e}")
+
+
+async def download_style_references(style_name: str, story_id: int, max_images: int = 4) -> list:
+    """
+    Search DuckDuckGo Images for the given style and download real reference images.
+    Saves to generated_images/style_refs/{story_id}/
+    Returns list of local file paths.
+    """
+    import os
+    from pathlib import Path
+    import aiohttp
+    import asyncio
+
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        logger.warning("duckduckgo-search not installed. Run: pip install duckduckgo-search")
+        return []
+
+    ref_dir = Path("generated_images/style_refs") / str(story_id)
+    ref_dir.mkdir(parents=True, exist_ok=True)
+
+    query = f"{style_name} anime illustration style reference high quality"
+    downloaded = []
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.images(query, max_results=max_images * 2))
+    except Exception as e:
+        logger.warning(f"DuckDuckGo search failed for '{style_name}': {e}")
+        return []
+
+    async def _download(url: str, idx: int):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=20) as resp:
+                    if resp.status == 200:
+                        content = await resp.read()
+                        ext = ".jpg"
+                        if "png" in resp.headers.get("Content-Type", ""):
+                            ext = ".png"
+                        filename = ref_dir / f"ref_{idx}{ext}"
+                        filename.write_bytes(content)
+                        return str(filename)
+        except Exception as e:
+            logger.warning(f"Failed to download style ref {url}: {e}")
+        return None
+
+    # Download top results concurrently
+    tasks = []
+    for i, r in enumerate(results[:max_images * 2]):
+        if "image" in r and r["image"]:
+            tasks.append(_download(r["image"], len(downloaded) + 1))
+            if len(tasks) >= max_images:
+                break
+
+    results_paths = await asyncio.gather(*tasks)
+    downloaded = [p for p in results_paths if p]
+
+    # Save paths to DB
+    if downloaded:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("UPDATE stories SET style_ref_images = ? WHERE story_id = ?",
+                      (json.dumps(downloaded), story_id))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Failed to save style_ref_images: {e}")
+
+    logger.info(f"Downloaded {len(downloaded)} style reference images for story {story_id}")
+    return downloaded
+
+
+async def _generate_and_store_character_ref(name: str, traits: str, story_id: int, cursor):
+    """Background task: generate reference image and update DB."""
+    try:
+        ref_path, face_prompt = await generate_character_reference(name, traits, story_id)
+        if ref_path:
+            cursor.execute("""
+                UPDATE characters 
+                SET reference_image_path = ?, face_lock_prompt = ?
+                WHERE story_id = ? AND name = ?
+            """, (ref_path, face_prompt, story_id, name))
+            logger.info(f"[Background] Generated reference image for {name}")
+    except Exception as e:
+        logger.warning(f"[Background] Character ref generation failed for {name}: {e}")
+
+
+async def generate_character_reference(name: str, traits: str, story_id: int) -> tuple:
+    """
+    Generate a clean character portrait using Grok Imagine.
+    Returns (reference_image_path, face_lock_prompt) or (None, None) on failure.
+    The face_lock_prompt is a short, reusable description for future image prompts.
+    """
+    if not grok_client:
+        logger.warning("Grok client not available for character reference generation")
+        return None, None
+
+    # Build a focused portrait prompt
+    portrait_prompt = (
+        f"official character portrait of {name}, {traits}, "
+        "front view, clean anime style, highly detailed face, expressive eyes, "
+        "consistent character design, neutral expression, sharp focus, "
+        "beautiful lighting, 8k, masterpiece"
+    )
+
+    timestamp = int(time.time())
+    filename = f"generated_images/character_{story_id}_{name.replace(' ', '_')}_{timestamp}.png"
+
+    try:
+        # Reuse the existing Grok Imagine caller
+        image_path = await generate_with_grok_imagine(
+            portrait_prompt, story_id, 0, model="grok-imagine-image-quality"
+        )
+        if image_path:
+            # Create a concise face lock prompt
+            face_lock = f"{name}: {traits}, consistent facial features and outfit"
+            return image_path, face_lock
+    except Exception as e:
+        logger.warning(f"Failed to generate character reference for {name}: {e}")
+
+    return None, None
 
 
 async def test_guardrail(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1697,9 +1952,15 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle pending image style setting (after /newstory or /setstyle)
     pending_story = context.user_data.get("awaiting_image_style_for")
     if pending_story and not text.startswith("/") and not text.upper() in ["A","B","C","D","E","I","G"]:
-        style = text.strip()
-        # Expand the style into a rich description using AI
-        expanded = await expand_style_description(style)
+        style = text.strip().lower()
+
+        # Handle skip
+        if style == "/skip" or style == "skip":
+            style = "real"
+            expanded = "realistic style, natural lighting, detailed environment"
+        else:
+            expanded = await expand_style_description(style)
+
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("""
@@ -1709,12 +1970,30 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (style, expanded, pending_story))
         conn.commit()
         conn.close()
+
+        # Auto-download style references (non-blocking for UX)
+        asyncio.create_task(_download_style_refs_background(style, pending_story))
+
         context.user_data.pop("awaiting_image_style_for", None)
+
+        # === Now generate Chapter 1 (style is set) ===
+        initial_prompt = context.user_data.get("initial_prompt", "")
+        chapter1, ch_num = generate_chapter(pending_story, initial_prompt=initial_prompt, is_first=True)
+        context.user_data["last_choices"] = parse_choices(chapter1)
+
         await update.message.reply_text(
-            f"✅ 已將故事 {pending_story} 的圖像風格設為：`{style}`\n"
-            f"已自動擴展為詳細描述（供本地模型使用）。\n\n"
-            f"請繼續選擇下一步（A/B/C/D/E/I/G）。"
+            f"✅ 圖像風格已設為：`{style}`\n"
+            f"已自動擴展為詳細描述。\n\n"
+            f"（第 {ch_num} 章）\n\n{chapter1}"
         )
+
+        # Background generate the first chapter image (using the newly set style)
+        if os.getenv("AUTO_CHAPTER_IMAGE", "true").lower() == "true":
+            chat_id = update.effective_chat.id
+            asyncio.create_task(
+                _background_generate_chapter_image(pending_story, ch_num, chapter1, chat_id, context.bot)
+            )
+
         return
 
     if not story_id:
@@ -1816,6 +2095,15 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["last_choices"] = parse_choices(chapter_text)
 
     await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}")
+
+    # === Background auto image generation (non-blocking) ===
+    # User can immediately continue choosing next option while image is being generated.
+    if os.getenv("AUTO_CHAPTER_IMAGE", "true").lower() == "true":
+        chat_id = update.effective_chat.id
+        # Capture the chapter content for the image prompt
+        asyncio.create_task(
+            _background_generate_chapter_image(story_id, ch_num, chapter_text, chat_id, context.bot)
+        )
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
