@@ -1466,9 +1466,18 @@ async def _background_generate_chapter_image(story_id: int, chapter_num: int, ch
                 )
             logger.info(f"[Background] Chapter image sent: story={story_id} ch={chapter_num}")
         else:
-            logger.info(f"[Background] Chapter image generation skipped or failed for story={story_id} ch={chapter_num}")
+            # Generation failed or returned error string — notify user
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ 第 {chapter_num} 章插圖生成失敗（ComfyUI 可能未啟動或發生錯誤）。\n你可以手動輸入 I 來重試。"
+            )
+            logger.warning(f"[Background] Chapter image generation failed for story={story_id} ch={chapter_num}")
     except Exception as e:
-        logger.warning(f"[Background] Chapter image generation error (story {story_id} ch {chapter_num}): {e}")
+        logger.error(f"[Background] Chapter image generation error (story {story_id} ch {chapter_num}): {e}")
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"⚠️ 第 {chapter_num} 章插圖生成時發生錯誤。")
+        except:
+            pass
 
     if effective_mode == "comfyui":
         progress_msg = None
