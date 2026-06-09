@@ -1620,40 +1620,30 @@ async def set_story_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def download_style_references(style_name: str, story_id: int, max_images: int = 4) -> list:
     """
-    Search DuckDuckGo Images for the given style and download real reference images.
+    Download style reference images from Unsplash Source (no API key, very stable).
     Saves to generated_images/style_refs/{story_id}/
     Returns list of local file paths.
     """
-    import os
     from pathlib import Path
     import aiohttp
     import asyncio
-
-    try:
-        from duckduckgo_search import DDGS
-    except ImportError:
-        logger.warning("duckduckgo-search not installed. Run: pip install duckduckgo-search")
-        return []
+    import random
 
     ref_dir = Path("generated_images/style_refs") / str(story_id)
     ref_dir.mkdir(parents=True, exist_ok=True)
 
-    query = f"{style_name} anime illustration style reference high quality"
+    # Build a good Unsplash query
+    query = f"{style_name} anime illustration style reference high quality".replace(" ", "+")
     downloaded = []
 
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.images(query, max_results=max_images * 2))
-    except Exception as e:
-        logger.warning(f"DuckDuckGo search failed for '{style_name}': {e}")
-        return []
-
-    async def _download(url: str, idx: int):
+    async def _download_unsplash(idx: int):
+        url = f"https://source.unsplash.com/random/800x600/?{query}&sig={random.randint(1, 999999)}"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=20) as resp:
+                async with session.get(url, timeout=25, allow_redirects=True) as resp:
                     if resp.status == 200:
                         content = await resp.read()
+                        # Unsplash usually returns JPEG
                         ext = ".jpg"
                         if "png" in resp.headers.get("Content-Type", ""):
                             ext = ".png"
@@ -1661,17 +1651,11 @@ async def download_style_references(style_name: str, story_id: int, max_images: 
                         filename.write_bytes(content)
                         return str(filename)
         except Exception as e:
-            logger.warning(f"Failed to download style ref {url}: {e}")
+            logger.warning(f"Failed to download Unsplash ref #{idx}: {e}")
         return None
 
-    # Download top results concurrently
-    tasks = []
-    for i, r in enumerate(results[:max_images * 2]):
-        if "image" in r and r["image"]:
-            tasks.append(_download(r["image"], len(downloaded) + 1))
-            if len(tasks) >= max_images:
-                break
-
+    # Download multiple images concurrently
+    tasks = [_download_unsplash(i + 1) for i in range(max_images)]
     results_paths = await asyncio.gather(*tasks)
     downloaded = [p for p in results_paths if p]
 
@@ -1687,7 +1671,7 @@ async def download_style_references(style_name: str, story_id: int, max_images: 
         except Exception as e:
             logger.warning(f"Failed to save style_ref_images: {e}")
 
-    logger.info(f"Downloaded {len(downloaded)} style reference images for story {story_id}")
+    logger.info(f"Downloaded {len(downloaded)} style reference images for story {story_id} (Unsplash)")
     return downloaded
 
 
