@@ -58,51 +58,53 @@ DB_PATH = BASE_DIR / "stories.db"
 def get_version() -> str:
     """
     Return a traceable version string derived from git.
-    Examples:
-      - v0.9.0-12-g3eb90d1
-      - 3eb90d1-dirty
-      - unknown
-    This ensures every commit produces a unique version visible in logs.
+    Guarantees a usable commit-based version even when no tags exist.
     """
+    # Try git describe first (best output when tags exist)
     try:
-        # Try to get a human-friendly description (tag + distance + commit)
         result = subprocess.run(
             ["git", "describe", "--tags", "--always", "--dirty"],
             cwd=BASE_DIR,
             capture_output=True,
             text=True,
-            timeout=2
+            timeout=3
         )
         if result.returncode == 0:
             version = result.stdout.strip()
             if version:
                 return version
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"git describe failed: {e}")
 
-    # Fallback: short commit hash only
+    # Fallback: always try rev-parse (works even with no tags)
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=BASE_DIR,
             capture_output=True,
             text=True,
-            timeout=2
+            timeout=3
         )
         if result.returncode == 0:
             commit = result.stdout.strip()
-            # Check for dirty working tree
-            dirty_check = subprocess.run(
-                ["git", "diff", "--quiet"],
-                cwd=BASE_DIR,
-                capture_output=True
-            )
-            if dirty_check.returncode != 0:
-                commit += "-dirty"
-            return commit
-    except Exception:
-        pass
+            if commit:
+                # Optional dirty flag
+                try:
+                    dirty = subprocess.run(
+                        ["git", "diff", "--quiet"],
+                        cwd=BASE_DIR,
+                        capture_output=True,
+                        timeout=2
+                    )
+                    if dirty.returncode != 0:
+                        commit += "-dirty"
+                except Exception:
+                    pass
+                return commit
+    except Exception as e:
+        logger.debug(f"git rev-parse failed: {e}")
 
+    logger.warning("Unable to determine git version — falling back to 'unknown'")
     return "unknown"
 
 
