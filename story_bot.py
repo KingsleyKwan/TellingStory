@@ -1509,7 +1509,6 @@ async def _background_generate_chapter_image(story_id: int, chapter_num: int, ch
     User can continue interacting while this runs.
     """
     try:
-        # Always use comfyui for automatic chapter images
         image_path = await generate_image_for_chapter(
             chapter_content, story_id, chapter_num, mode="comfyui"
         )
@@ -1526,7 +1525,6 @@ async def _background_generate_chapter_image(story_id: int, chapter_num: int, ch
                 )
             logger.info(f"[Background] Chapter image sent: story={story_id} ch={chapter_num}")
         else:
-            # Generation failed or returned error string — notify user
             await bot.send_message(
                 chat_id=chat_id,
                 text=f"⚠️ 第 {chapter_num} 章插圖生成失敗（ComfyUI 可能未啟動或發生錯誤）。\n你可以手動輸入 I 來重試。"
@@ -1538,30 +1536,6 @@ async def _background_generate_chapter_image(story_id: int, chapter_num: int, ch
             await bot.send_message(chat_id=chat_id, text=f"⚠️ 第 {chapter_num} 章插圖生成時發生錯誤。")
         except:
             pass
-
-        # Try real ComfyUI generation
-        try:
-            image_path = await generate_with_comfyui(prompt, story_id, chapter_num, progress_message=progress_msg)
-            if image_path:
-                return image_path
-        except Exception as e:
-            logger.error(f"ComfyUI generation error: {e}")
-
-        # If ComfyUI fails, fall back to giving the user the prompt
-        return f"【圖像生成失敗】\nComfyUI 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
-
-    else:
-        # Grok Imagine path
-        grok_model = os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-quality")
-        try:
-            image_path = await generate_with_grok_imagine(prompt, story_id, chapter_num, model=grok_model)
-            if image_path:
-                return image_path
-        except Exception as e:
-            logger.error(f"Grok Imagine generation error: {e}")
-
-        # Use the already-initialized prompt (or chapter_content as fallback)
-        return f"【圖像生成失敗】\nGrok Imagine 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
 
 
 async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
