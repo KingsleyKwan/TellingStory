@@ -1437,9 +1437,11 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
     - If mode=="grok" or IMAGE_MODE=="grok": use Grok Imagine API.
     - Otherwise: fallback to prompt only.
     """
+    # Always initialize prompt so error handlers never see an undefined variable
+    prompt = chapter_content[:300] + "..." if chapter_content else "story scene"
+
     # Prompt optimization (recommended for better image quality)
     use_optimizer = os.getenv("USE_IMAGE_PROMPT_OPTIMIZER", "true").lower() == "true"
-    prompt = None
     if use_optimizer:
         prompt = await optimize_image_prompt(chapter_content, story_id)
 
@@ -1558,9 +1560,8 @@ async def _background_generate_chapter_image(story_id: int, chapter_num: int, ch
         except Exception as e:
             logger.error(f"Grok Imagine generation error: {e}")
 
-        # Safe fallback error message (prompt may not be defined in all call paths)
-        safe_prompt = prompt if 'prompt' in locals() else chapter_content[:300] + "..."
-        return f"【圖像生成失敗】\nGrok Imagine 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{safe_prompt}"
+        # Use the already-initialized prompt (or chapter_content as fallback)
+        return f"【圖像生成失敗】\nGrok Imagine 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
 
 
 async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
