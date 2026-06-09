@@ -1492,6 +1492,39 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
 
     effective_mode = mode or IMAGE_MODE
 
+    if effective_mode == "comfyui":
+        progress_msg = None
+        if update:
+            try:
+                progress_msg = await update.message.reply_text(
+                    "🖼️ 正在使用 ComfyUI Flux 生成圖像...\n"
+                    "預計時間：4-7 分鐘（視硬件而定）\n"
+                    "每 30 秒更新一次狀態"
+                )
+            except Exception as e:
+                logger.warning(f"無法發送進度訊息: {e}")
+
+        try:
+            image_path = await generate_with_comfyui(prompt, story_id, chapter_num, progress_message=progress_msg)
+            if image_path:
+                return image_path
+        except Exception as e:
+            logger.error(f"ComfyUI generation error: {e}")
+
+        return f"【圖像生成失敗】\nComfyUI 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
+
+    else:
+        # Grok Imagine path
+        grok_model = os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-quality")
+        try:
+            image_path = await generate_with_grok_imagine(prompt, story_id, chapter_num, model=grok_model)
+            if image_path:
+                return image_path
+        except Exception as e:
+            logger.error(f"Grok Imagine generation error: {e}")
+
+        return f"【圖像生成失敗】\nGrok Imagine 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
+
 
 async def _download_style_refs_background(style: str, story_id: int):
     """Background task to download style reference images without blocking the user."""
@@ -1621,6 +1654,7 @@ async def set_story_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def download_style_references(style_name: str, story_id: int, max_images: int = 4) -> list:
     """
     Download style reference images from Unsplash Source (no API key, very stable).
+    Uses certifi for SSL on macOS.
     Saves to generated_images/style_refs/{story_id}/
     Returns list of local file paths.
     """
@@ -1628,22 +1662,26 @@ async def download_style_references(style_name: str, story_id: int, max_images: 
     import aiohttp
     import asyncio
     import random
+    import ssl
+    import certifi
 
     ref_dir = Path("generated_images/style_refs") / str(story_id)
     ref_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build a good Unsplash query
     query = f"{style_name} anime illustration style reference high quality".replace(" ", "+")
     downloaded = []
+
+    # Create SSL context with certifi (fixes macOS certificate issues)
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
 
     async def _download_unsplash(idx: int):
         url = f"https://source.unsplash.com/random/800x600/?{query}&sig={random.randint(1, 999999)}"
         try:
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(url, timeout=25, allow_redirects=True) as resp:
                     if resp.status == 200:
                         content = await resp.read()
-                        # Unsplash usually returns JPEG
                         ext = ".jpg"
                         if "png" in resp.headers.get("Content-Type", ""):
                             ext = ".png"
@@ -1654,12 +1692,10 @@ async def download_style_references(style_name: str, story_id: int, max_images: 
             logger.warning(f"Failed to download Unsplash ref #{idx}: {e}")
         return None
 
-    # Download multiple images concurrently
     tasks = [_download_unsplash(i + 1) for i in range(max_images)]
     results_paths = await asyncio.gather(*tasks)
     downloaded = [p for p in results_paths if p]
 
-    # Save paths to DB
     if downloaded:
         try:
             conn = sqlite3.connect(DB_PATH)
