@@ -833,11 +833,45 @@ async def load_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["current_story_id"] = story_id
-    context.user_data.pop("last_choices", None)  # reset choices when switching stories
-    await update.message.reply_text(
-        f"✅ 已載入 Story ID `{story_id}`！\n"
-        f"現在可以直接輸入 A / B / C / D / E / I 繼續故事。"
-    )
+
+    # Load latest chapter so user sees where they left off + available choices
+    latest_chapter = None
+    latest_ch_num = 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            SELECT chapter_num, content FROM chapters
+            WHERE story_id = ?
+            ORDER BY chapter_num DESC LIMIT 1
+        """, (story_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            latest_ch_num, latest_chapter = row
+            context.user_data["last_choices"] = parse_choices(latest_chapter or "")
+    except Exception as e:
+        logger.warning(f"Failed to load latest chapter on /loadstory: {e}")
+
+    if latest_chapter:
+        # Send the last chapter so user knows the current situation and choices
+        header = f"📖 **Story {story_id} — 第 {latest_ch_num} 章（最新）**\n\n"
+        # Telegram has ~4096 char limit; send full if possible, otherwise note it
+        if len(latest_chapter) > 3800:
+            preview = latest_chapter[:3500] + "\n\n...（章節較長，已截斷，完整內容請參考先前對話）"
+            await update.message.reply_text(header + preview)
+        else:
+            await update.message.reply_text(header + latest_chapter)
+        await update.message.reply_text(
+            "請輸入 A / B / C / D / E / I / G 選擇下一步（或輸入完整選項文字）。"
+        )
+    else:
+        context.user_data.pop("last_choices", None)
+        await update.message.reply_text(
+            f"✅ 已載入 Story ID `{story_id}`！\n"
+            f"（此故事尚無章節）\n"
+            f"現在可以直接輸入 A / B / C / D / E / I 繼續故事。"
+        )
 
 
 # ====================== IMAGE GENERATION ======================
