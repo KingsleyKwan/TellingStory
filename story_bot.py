@@ -177,7 +177,14 @@ def load_story_context(story_id: int) -> dict:
     c.execute("SELECT story_bible, current_chapter FROM stories WHERE story_id = ?", (story_id,))
     row = c.fetchone()
     story_bible = row[0] if row else "{}"
-    current_chapter = row[1] if row else 1
+    stored_current = row[1] if row else 1
+
+    # Compute the real current chapter from actual chapter records (defensive against desync)
+    c.execute("SELECT COALESCE(MAX(chapter_num), 0) FROM chapters WHERE story_id = ?", (story_id,))
+    actual_max = c.fetchone()[0] or 0
+    current_chapter = max(stored_current, actual_max)
+    if current_chapter > stored_current:
+        logger.warning(f"Corrected current_chapter for story {story_id}: stored={stored_current} → actual={current_chapter}")
 
     c.execute("""SELECT chapter_num, content, choice_made 
                  FROM chapters WHERE story_id = ? 
