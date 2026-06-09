@@ -1492,6 +1492,39 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
 
     effective_mode = mode or IMAGE_MODE
 
+    if effective_mode == "comfyui":
+        progress_msg = None
+        if update:
+            try:
+                progress_msg = await update.message.reply_text(
+                    "🖼️ 正在使用 ComfyUI Flux 生成圖像...\n"
+                    "預計時間：4-7 分鐘（視硬件而定）\n"
+                    "每 30 秒更新一次狀態"
+                )
+            except Exception as e:
+                logger.warning(f"無法發送進度訊息: {e}")
+
+        try:
+            image_path = await generate_with_comfyui(prompt, story_id, chapter_num, progress_message=progress_msg)
+            if image_path:
+                return image_path
+        except Exception as e:
+            logger.error(f"ComfyUI generation error: {e}")
+
+        return f"【圖像生成失敗】\nComfyUI 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
+
+    else:
+        # Grok Imagine path
+        grok_model = os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-quality")
+        try:
+            image_path = await generate_with_grok_imagine(prompt, story_id, chapter_num, model=grok_model)
+            if image_path:
+                return image_path
+        except Exception as e:
+            logger.error(f"Grok Imagine generation error: {e}")
+
+        return f"【圖像生成失敗】\nGrok Imagine 無法成功生成圖片。\n\n你可以複製以下 prompt 手動生成：\n\n{prompt}"
+
 
 async def _download_style_refs_background(style: str, story_id: int):
     """Background task to download style reference images without blocking the user."""
