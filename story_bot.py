@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 from datetime import datetime
@@ -58,51 +59,56 @@ DB_PATH = BASE_DIR / "stories.db"
 def get_version() -> str:
     """
     Return a traceable version string derived from git.
-    Examples:
-      - v0.9.0-12-g3eb90d1
-      - 3eb90d1-dirty
-      - unknown
-    This ensures every commit produces a unique version visible in logs.
+    Tries multiple strategies so it works reliably on macOS and other environments.
     """
-    try:
-        # Try to get a human-friendly description (tag + distance + commit)
-        result = subprocess.run(
-            ["git", "describe", "--tags", "--always", "--dirty"],
-            cwd=BASE_DIR,
-            capture_output=True,
-            text=True,
-            timeout=2
-        )
-        if result.returncode == 0:
-            version = result.stdout.strip()
-            if version:
-                return version
-    except Exception:
-        pass
+    git_cmd = shutil.which("git")
 
-    # Fallback: short commit hash only
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=BASE_DIR,
-            capture_output=True,
-            text=True,
-            timeout=2
-        )
-        if result.returncode == 0:
-            commit = result.stdout.strip()
-            # Check for dirty working tree
-            dirty_check = subprocess.run(
-                ["git", "diff", "--quiet"],
+    # Strategy 1: Use git binary if found in PATH
+    if git_cmd:
+        try:
+            result = subprocess.run(
+                [git_cmd, "rev-parse", "--short", "HEAD"],
                 cwd=BASE_DIR,
-                capture_output=True
+                capture_output=True,
+                text=True,
+                timeout=3
             )
-            if dirty_check.returncode != 0:
-                commit += "-dirty"
-            return commit
-    except Exception:
-        pass
+            if result.returncode == 0:
+                commit = result.stdout.strip()
+                if commit:
+                    # Check for dirty tree (optional)
+                    try:
+                        dirty = subprocess.run(
+                            [git_cmd, "diff", "--quiet"],
+                            cwd=BASE_DIR,
+                            capture_output=True,
+                            timeout=2
+                        )
+                        if dirty.returncode != 0:
+                            commit += "-dirty"
+                    except Exception:
+                        pass
+                    return commit
+        except Exception as e:
+            logger.warning(f"git subprocess failed: {e}")
 
+    # Strategy 2: Read .git/HEAD directly (no external git binary needed)
+    try:
+        head_file = BASE_DIR / ".git" / "HEAD"
+        if head_file.exists():
+            head_content = head_file.read_text().strip()
+            if head_content.startswith("ref: "):
+                ref_path = BASE_DIR / ".git" / head_content[5:]
+                if ref_path.exists():
+                    commit = ref_path.read_text().strip()[:7]
+                    return commit
+            else:
+                # Detached HEAD
+                return head_content[:7]
+    except Exception as e:
+        logger.warning(f"Direct .git/HEAD read failed: {e}")
+
+    logger.warning("Unable to determine git version — falling back to 'unknown'")
     return "unknown"
 
 
