@@ -108,6 +108,10 @@ def init_db():
         c.execute("ALTER TABLE stories ADD COLUMN image_style_prompt TEXT")
     except sqlite3.OperationalError:
         pass
+    try:
+        c.execute("ALTER TABLE stories ADD COLUMN style_ref_images TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     c.execute('''CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,6 +144,16 @@ def init_db():
             UNIQUE(story_id, name)
         )
     ''')
+
+    # v3.1 - Character reference image columns (for face/outlook consistency)
+    try:
+        c.execute("ALTER TABLE characters ADD COLUMN reference_image_path TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE characters ADD COLUMN face_lock_prompt TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS character_relationships (
@@ -677,6 +691,21 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
                             info.get("current_state")
                         ))
                     logger.info(f"Synced {len(char_data)} characters for story {story_id}")
+
+                    # Auto-generate character reference images for new characters (face/outlook consistency)
+                    if grok_client:
+                        for name, info in char_data.items():
+                            try:
+                                c.execute("SELECT reference_image_path FROM characters WHERE story_id = ? AND name = ?", (story_id, name))
+                                existing = c.fetchone()
+                                if existing and existing[0]:
+                                    continue  # already has reference
+
+                                traits = info.get("appearance") or info.get("traits") or ""
+                                # Run async generation in background (non-blocking)
+                                asyncio.create_task(_generate_and_store_character_ref(name, traits, story_id, c))
+                            except Exception as e:
+                                logger.warning(f"Character reference scheduling failed for {name}: {e}")
 
                 # Insert / Update relationships
                 if rel_data:
@@ -1384,6 +1413,24 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
     except Exception as e:
         logger.warning(f"Failed to load image_style for story {story_id}: {e}")
 
+    # Inject character face_lock_prompts for consistency (if any characters have references)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            SELECT name, face_lock_prompt FROM characters 
+            WHERE story_id = ? AND face_lock_prompt IS NOT NULL
+        """, (story_id,))
+        char_refs = c.fetchall()
+        conn.close()
+
+        if char_refs:
+            face_locks = "; ".join([f"{row[1]}" for row in char_refs])
+            prompt = f"{prompt}, character consistency: {face_locks}"
+            logger.info(f"Applied {len(char_refs)} character face lock(s)")
+    except Exception as e:
+        logger.warning(f"Failed to load character face locks: {e}")
+
     # === DEBUG LOG: show exactly what prompt is sent to the image generator ===
     logger.info(f"[FINAL IMAGE PROMPT] {prompt}")
 
@@ -1493,6 +1540,140 @@ async def set_story_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ 故事 {target_story} 的圖像風格已設為：`{style}`\n"
         f"已自動擴展為詳細描述（供本地模型使用）。"
     )
+
+    # Auto-download style reference images from DuckDuckGo
+    try:
+        ref_paths = await download_style_references(style, target_story)
+        if ref_paths:
+            await update.message.reply_text(
+                f"已自動下載 {len(ref_paths)} 張風格參考圖（存於 generated_images/style_refs/{target_story}/）"
+            )
+    except Exception as e:
+        logger.warning(f"Style reference download failed: {e}")
+
+
+async def download_style_references(style_name: str, story_id: int, max_images: int = 4) -> list:
+    """
+    Search DuckDuckGo Images for the given style and download real reference images.
+    Saves to generated_images/style_refs/{story_id}/
+    Returns list of local file paths.
+    """
+    import os
+    from pathlib import Path
+    import aiohttp
+    import asyncio
+
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        logger.warning("duckduckgo-search not installed. Run: pip install duckduckgo-search")
+        return []
+
+    ref_dir = Path("generated_images/style_refs") / str(story_id)
+    ref_dir.mkdir(parents=True, exist_ok=True)
+
+    query = f"{style_name} anime illustration style reference high quality"
+    downloaded = []
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.images(query, max_results=max_images * 2))
+    except Exception as e:
+        logger.warning(f"DuckDuckGo search failed for '{style_name}': {e}")
+        return []
+
+    async def _download(url: str, idx: int):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=20) as resp:
+                    if resp.status == 200:
+                        content = await resp.read()
+                        ext = ".jpg"
+                        if "png" in resp.headers.get("Content-Type", ""):
+                            ext = ".png"
+                        filename = ref_dir / f"ref_{idx}{ext}"
+                        filename.write_bytes(content)
+                        return str(filename)
+        except Exception as e:
+            logger.warning(f"Failed to download style ref {url}: {e}")
+        return None
+
+    # Download top results concurrently
+    tasks = []
+    for i, r in enumerate(results[:max_images * 2]):
+        if "image" in r and r["image"]:
+            tasks.append(_download(r["image"], len(downloaded) + 1))
+            if len(tasks) >= max_images:
+                break
+
+    results_paths = await asyncio.gather(*tasks)
+    downloaded = [p for p in results_paths if p]
+
+    # Save paths to DB
+    if downloaded:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("UPDATE stories SET style_ref_images = ? WHERE story_id = ?",
+                      (json.dumps(downloaded), story_id))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Failed to save style_ref_images: {e}")
+
+    logger.info(f"Downloaded {len(downloaded)} style reference images for story {story_id}")
+    return downloaded
+
+
+async def _generate_and_store_character_ref(name: str, traits: str, story_id: int, cursor):
+    """Background task: generate reference image and update DB."""
+    try:
+        ref_path, face_prompt = await generate_character_reference(name, traits, story_id)
+        if ref_path:
+            cursor.execute("""
+                UPDATE characters 
+                SET reference_image_path = ?, face_lock_prompt = ?
+                WHERE story_id = ? AND name = ?
+            """, (ref_path, face_prompt, story_id, name))
+            logger.info(f"[Background] Generated reference image for {name}")
+    except Exception as e:
+        logger.warning(f"[Background] Character ref generation failed for {name}: {e}")
+
+
+async def generate_character_reference(name: str, traits: str, story_id: int) -> tuple:
+    """
+    Generate a clean character portrait using Grok Imagine.
+    Returns (reference_image_path, face_lock_prompt) or (None, None) on failure.
+    The face_lock_prompt is a short, reusable description for future image prompts.
+    """
+    if not grok_client:
+        logger.warning("Grok client not available for character reference generation")
+        return None, None
+
+    # Build a focused portrait prompt
+    portrait_prompt = (
+        f"official character portrait of {name}, {traits}, "
+        "front view, clean anime style, highly detailed face, expressive eyes, "
+        "consistent character design, neutral expression, sharp focus, "
+        "beautiful lighting, 8k, masterpiece"
+    )
+
+    timestamp = int(time.time())
+    filename = f"generated_images/character_{story_id}_{name.replace(' ', '_')}_{timestamp}.png"
+
+    try:
+        # Reuse the existing Grok Imagine caller
+        image_path = await generate_with_grok_imagine(
+            portrait_prompt, story_id, 0, model="grok-imagine-image-quality"
+        )
+        if image_path:
+            # Create a concise face lock prompt
+            face_lock = f"{name}: {traits}, consistent facial features and outfit"
+            return image_path, face_lock
+    except Exception as e:
+        logger.warning(f"Failed to generate character reference for {name}: {e}")
+
+    return None, None
 
 
 async def test_guardrail(update: Update, context: ContextTypes.DEFAULT_TYPE):
