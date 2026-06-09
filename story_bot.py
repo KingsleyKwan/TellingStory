@@ -810,17 +810,13 @@ async def new_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["current_story_id"] = story_id
     context.user_data["initial_prompt"] = prompt
-    context.user_data["awaiting_image_style_for"] = story_id   # ask for style next
-
-    chapter1, _ = generate_chapter(story_id, initial_prompt=prompt, is_first=True)
-
-    # Parse and store choices for future letter resolution
-    context.user_data["last_choices"] = parse_choices(chapter1)
+    context.user_data["awaiting_image_style_for"] = story_id   # ask for style first
 
     await update.message.reply_text(
         f"✅ 新故事已建立！Story ID: `{story_id}`\n\n"
-        f"{chapter1}\n\n"
-        "請回覆你想要的**圖像風格**（例如：real、SAO、某某畫家、某某作品），或輸入 /skip 使用預設 real。"
+        f"請先回覆你想要的**圖像風格**（例如：real、SAO、某某畫家、某某作品），\n"
+        f"或輸入 `/skip` 使用預設 real。\n\n"
+        f"設定風格後，系統會生成第 1 章。"
     )
 
 
@@ -1437,6 +1433,14 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
     effective_mode = mode or IMAGE_MODE
 
 
+async def _download_style_refs_background(style: str, story_id: int):
+    """Background task to download style reference images without blocking the user."""
+    try:
+        await download_style_references(style, story_id)
+    except Exception as e:
+        logger.warning(f"Background style reference download failed: {e}")
+
+
 async def _background_generate_chapter_image(story_id: int, chapter_num: int, chapter_content: str, chat_id: int, bot):
     """
     Non-blocking background task.
@@ -1949,9 +1953,15 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle pending image style setting (after /newstory or /setstyle)
     pending_story = context.user_data.get("awaiting_image_style_for")
     if pending_story and not text.startswith("/") and not text.upper() in ["A","B","C","D","E","I","G"]:
-        style = text.strip()
-        # Expand the style into a rich description using AI
-        expanded = await expand_style_description(style)
+        style = text.strip().lower()
+
+        # Handle skip
+        if style == "/skip" or style == "skip":
+            style = "real"
+            expanded = "realistic style, natural lighting, detailed environment"
+        else:
+            expanded = await expand_style_description(style)
+
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("""
@@ -1961,12 +1971,30 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (style, expanded, pending_story))
         conn.commit()
         conn.close()
+
+        # Auto-download style references (non-blocking for UX)
+        asyncio.create_task(_download_style_refs_background(style, pending_story))
+
         context.user_data.pop("awaiting_image_style_for", None)
+
+        # === Now generate Chapter 1 (style is set) ===
+        initial_prompt = context.user_data.get("initial_prompt", "")
+        chapter1, ch_num = generate_chapter(pending_story, initial_prompt=initial_prompt, is_first=True)
+        context.user_data["last_choices"] = parse_choices(chapter1)
+
         await update.message.reply_text(
-            f"✅ 已將故事 {pending_story} 的圖像風格設為：`{style}`\n"
-            f"已自動擴展為詳細描述（供本地模型使用）。\n\n"
-            f"請繼續選擇下一步（A/B/C/D/E/I/G）。"
+            f"✅ 圖像風格已設為：`{style}`\n"
+            f"已自動擴展為詳細描述。\n\n"
+            f"（第 {ch_num} 章）\n\n{chapter1}"
         )
+
+        # Background generate the first chapter image (using the newly set style)
+        if os.getenv("AUTO_CHAPTER_IMAGE", "true").lower() == "true":
+            chat_id = update.effective_chat.id
+            asyncio.create_task(
+                _background_generate_chapter_image(pending_story, ch_num, chapter1, chat_id, context.bot)
+            )
+
         return
 
     if not story_id:
