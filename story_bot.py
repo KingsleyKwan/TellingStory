@@ -1479,18 +1479,6 @@ async def _background_generate_chapter_image(story_id: int, chapter_num: int, ch
         except:
             pass
 
-    if effective_mode == "comfyui":
-        progress_msg = None
-        if update:
-            try:
-                progress_msg = await update.message.reply_text(
-                    "🖼️ 正在使用 ComfyUI Flux 生成圖像...\n"
-                    "預計時間：4-7 分鐘（視硬件而定）\n"
-                    "每 30 秒更新一次狀態"
-                )
-            except Exception as e:
-                logger.warning(f"無法發送進度訊息: {e}")
-
         # Try real ComfyUI generation
         try:
             image_path = await generate_with_comfyui(prompt, story_id, chapter_num, progress_message=progress_msg)
