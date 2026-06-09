@@ -54,6 +54,58 @@ COMFYUI_URL = os.getenv("COMFYUI_URL", "http://127.0.0.1:8188")
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "stories.db"
 
+
+def get_version() -> str:
+    """
+    Return a traceable version string derived from git.
+    Examples:
+      - v0.9.0-12-g3eb90d1
+      - 3eb90d1-dirty
+      - unknown
+    This ensures every commit produces a unique version visible in logs.
+    """
+    try:
+        # Try to get a human-friendly description (tag + distance + commit)
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--always", "--dirty"],
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if result.returncode == 0:
+            version = result.stdout.strip()
+            if version:
+                return version
+    except Exception:
+        pass
+
+    # Fallback: short commit hash only
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if result.returncode == 0:
+            commit = result.stdout.strip()
+            # Check for dirty working tree
+            dirty_check = subprocess.run(
+                ["git", "diff", "--quiet"],
+                cwd=BASE_DIR,
+                capture_output=True
+            )
+            if dirty_check.returncode != 0:
+                commit += "-dirty"
+            return commit
+    except Exception:
+        pass
+
+    return "unknown"
+
+
 # ====================== SIMPLE TTL CACHE ======================
 import time
 
@@ -2117,10 +2169,12 @@ def main():
     app.add_handler(CommandHandler("test_image", test_image))
     app.add_handler(CommandHandler("test_grok_image", test_grok_image))
     app.add_handler(CommandHandler("bug", handle_bug_report))
+    app.add_handler(CommandHandler("version", lambda u, c: u.message.reply_text(f"sleyStory version: {get_version()}")))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice))
 
     mode = "DeepSeek V4 Flash + Grok Polish + Local Guardrail" if (deepseek_client and USE_DEEPSEEK_THINKING) else "Grok + Local Guardrail"
-    print(f"📖 sleyStory bot is running... ({mode} mode)")
+    version = get_version()
+    print(f"📖 sleyStory bot is running... ({mode} mode) — version: {version}")
     app.run_polling()
 
 if __name__ == "__main__":
