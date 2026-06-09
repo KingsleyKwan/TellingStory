@@ -35,6 +35,13 @@ GROK_API_KEY = os.getenv("GROK_API_KEY")
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-3-latest")
 grok_client = OpenAI(base_url="https://api.x.ai/v1", api_key=GROK_API_KEY) if GROK_API_KEY else None
 
+# DeepSeek V4 Flash (cheap multi-round thinking + drafting)
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+DEEPSEEK_THINK_ROUNDS = int(os.getenv("DEEPSEEK_THINK_ROUNDS", "2"))
+USE_DEEPSEEK_THINKING = os.getenv("USE_DEEPSEEK_THINKING", "true").lower() == "true"
+deepseek_client = OpenAI(base_url="https://api.deepseek.com", api_key=DEEPSEEK_API_KEY) if DEEPSEEK_API_KEY else None
+
 # Local LM Studio (Guardrail)
 LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://192.168.1.96:1234/v1")
 LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "gemma-4-E4B")
@@ -403,22 +410,75 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
         return any(phrase in text_lower for phrase in REFUSAL_PHRASES)
 
     try:
-        # Step 1: Generate with Grok (primary)
-        response = grok_client.chat.completions.create(
-            model=GROK_MODEL,
-            messages=[
-                {"role": "system", "content": GROK_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg}
-            ],
-            temperature=0.85,
-            max_tokens=3500
-        )
-        full_output = response.choices[0].message.content.strip()
-        used_model = "grok"
+        if deepseek_client and USE_DEEPSEEK_THINKING:
+            # === COST-SAVING PIPELINE: DeepSeek V4 Flash (multi-round thinking) + Grok (final polish) ===
+            logger.info(f"[DeepSeek Pipeline] story={story_id} chapter={chapter_num} rounds={DEEPSEEK_THINK_ROUNDS}")
 
-        # Fallback to local AI if Grok refuses
+            current_draft = ""
+            for r in range(1, DEEPSEEK_THINK_ROUNDS + 1):
+                if r == 1:
+                    thinking_msg = user_msg + "\n\n【思考模式】請先仔細思考劇情、角色動機與細節，再輸出完整章節。"
+                else:
+                    thinking_msg = f"""以下是上一輪的草稿：
+{current_draft}
+
+【改進任務】請深入思考如何提升：
+- 劇情流暢度與張力
+- 角色情感與動機一致性
+- 細節豐富度與沉浸感
+然後輸出改進後的完整章節（不要省略任何部分）。
+
+輸出格式仍必須嚴格遵守：故事本文 + ---DATA + JSON。"""
+
+                resp = deepseek_client.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=[
+                        {"role": "system", "content": GROK_SYSTEM_PROMPT},
+                        {"role": "user", "content": thinking_msg}
+                    ],
+                    temperature=0.82,
+                    max_tokens=3800
+                )
+                current_draft = resp.choices[0].message.content.strip()
+                logger.info(f"[DeepSeek] round {r}/{DEEPSEEK_THINK_ROUNDS} completed")
+
+            # Final polish by Grok (lightweight, high-quality)
+            logger.info(f"[Grok Polish] Sending DeepSeek draft to Grok for final modification (story {story_id})")
+            grok_polish_msg = f"""以下是 DeepSeek V4 Flash 經過 {DEEPSEEK_THINK_ROUNDS} 輪思考與改寫後的章節草稿。
+
+請你負責「最終潤飾與修改」，目標是讓故事更具文學性、情感深度、角色一致性與敘事張力。
+請保留原有劇情核心，只進行必要的優化與潤色。
+
+{current_draft}"""
+
+            response = grok_client.chat.completions.create(
+                model=GROK_MODEL,
+                messages=[
+                    {"role": "system", "content": GROK_SYSTEM_PROMPT},
+                    {"role": "user", "content": grok_polish_msg}
+                ],
+                temperature=0.75,
+                max_tokens=3800
+            )
+            full_output = response.choices[0].message.content.strip()
+            used_model = "deepseek+grok"
+        else:
+            # Original Grok-first path (when DeepSeek thinking is disabled or no key)
+            response = grok_client.chat.completions.create(
+                model=GROK_MODEL,
+                messages=[
+                    {"role": "system", "content": GROK_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.85,
+                max_tokens=3500
+            )
+            full_output = response.choices[0].message.content.strip()
+            used_model = "grok"
+
+        # Fallback to local AI if the final model refuses
         if is_refusal(full_output) and local_client:
-            logger.warning(f"Grok refused to generate chapter {chapter_num} for story {story_id}. Falling back to local model.")
+            logger.warning(f"Final model refused to generate chapter {chapter_num} for story {story_id}. Falling back to local model.")
             local_system = (
                 "【最高優先級指令 - 嚴格格式控制 + 內容寬鬆】\n"
                 "你必須嚴格按照以下格式輸出，絕對不能有任何額外文字、解釋、或重複：\n\n"
@@ -1771,7 +1831,8 @@ def main():
     app.add_handler(CommandHandler("bug", handle_bug_report))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice))
 
-    print("📖 sleyStory bot is running... (Hybrid Grok + Local Guardrail mode)")
+    mode = "DeepSeek V4 Flash + Grok Polish + Local Guardrail" if (deepseek_client and USE_DEEPSEEK_THINKING) else "Grok + Local Guardrail"
+    print(f"📖 sleyStory bot is running... ({mode} mode)")
     app.run_polling()
 
 if __name__ == "__main__":
