@@ -1436,6 +1436,36 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
 
     effective_mode = mode or IMAGE_MODE
 
+
+async def _background_generate_chapter_image(story_id: int, chapter_num: int, chapter_content: str, chat_id: int, bot):
+    """
+    Non-blocking background task.
+    Generates chapter illustration using local ComfyUI and sends it to the user.
+    The image filename includes story_id and chapter_num.
+    User can continue interacting while this runs.
+    """
+    try:
+        # Always use comfyui for automatic chapter images
+        image_path = await generate_image_for_chapter(
+            chapter_content, story_id, chapter_num, mode="comfyui"
+        )
+
+        if image_path and not image_path.startswith("【"):
+            from telegram import InputFile
+            with open(image_path, "rb") as f:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=InputFile(f, filename=os.path.basename(image_path)),
+                    caption=f"🖼️ Story {story_id} · 第 {chapter_num} 章 插圖",
+                    read_timeout=120,
+                    write_timeout=120
+                )
+            logger.info(f"[Background] Chapter image sent: story={story_id} ch={chapter_num}")
+        else:
+            logger.info(f"[Background] Chapter image generation skipped or failed for story={story_id} ch={chapter_num}")
+    except Exception as e:
+        logger.warning(f"[Background] Chapter image generation error (story {story_id} ch {chapter_num}): {e}")
+
     if effective_mode == "comfyui":
         progress_msg = None
         if update:
@@ -2038,6 +2068,15 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["last_choices"] = parse_choices(chapter_text)
 
     await update.message.reply_text(f"（第 {ch_num} 章）\n\n{chapter_text}")
+
+    # === Background auto image generation (non-blocking) ===
+    # User can immediately continue choosing next option while image is being generated.
+    if os.getenv("AUTO_CHAPTER_IMAGE", "true").lower() == "true":
+        chat_id = update.effective_chat.id
+        # Capture the chapter content for the image prompt
+        asyncio.create_task(
+            _background_generate_chapter_image(story_id, ch_num, chapter_text, chat_id, context.bot)
+        )
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
