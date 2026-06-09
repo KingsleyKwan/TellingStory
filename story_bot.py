@@ -35,6 +35,13 @@ GROK_API_KEY = os.getenv("GROK_API_KEY")
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-3-latest")
 grok_client = OpenAI(base_url="https://api.x.ai/v1", api_key=GROK_API_KEY) if GROK_API_KEY else None
 
+# DeepSeek V4 Flash (cheap multi-round thinking + drafting)
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+DEEPSEEK_THINK_ROUNDS = int(os.getenv("DEEPSEEK_THINK_ROUNDS", "2"))
+USE_DEEPSEEK_THINKING = os.getenv("USE_DEEPSEEK_THINKING", "true").lower() == "true"
+deepseek_client = OpenAI(base_url="https://api.deepseek.com", api_key=DEEPSEEK_API_KEY) if DEEPSEEK_API_KEY else None
+
 # Local LM Studio (Guardrail)
 LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://192.168.1.96:1234/v1")
 LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "gemma-4-E4B")
@@ -403,22 +410,75 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
         return any(phrase in text_lower for phrase in REFUSAL_PHRASES)
 
     try:
-        # Step 1: Generate with Grok (primary)
-        response = grok_client.chat.completions.create(
-            model=GROK_MODEL,
-            messages=[
-                {"role": "system", "content": GROK_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg}
-            ],
-            temperature=0.85,
-            max_tokens=3500
-        )
-        full_output = response.choices[0].message.content.strip()
-        used_model = "grok"
+        if deepseek_client and USE_DEEPSEEK_THINKING:
+            # === COST-SAVING PIPELINE: DeepSeek V4 Flash (multi-round thinking) + Grok (final polish) ===
+            logger.info(f"[DeepSeek Pipeline] story={story_id} chapter={chapter_num} rounds={DEEPSEEK_THINK_ROUNDS}")
 
-        # Fallback to local AI if Grok refuses
+            current_draft = ""
+            for r in range(1, DEEPSEEK_THINK_ROUNDS + 1):
+                if r == 1:
+                    thinking_msg = user_msg + "\n\n【思考模式】請先仔細思考劇情、角色動機與細節，再輸出完整章節。"
+                else:
+                    thinking_msg = f"""以下是上一輪的草稿：
+{current_draft}
+
+【改進任務】請深入思考如何提升：
+- 劇情流暢度與張力
+- 角色情感與動機一致性
+- 細節豐富度與沉浸感
+然後輸出改進後的完整章節（不要省略任何部分）。
+
+輸出格式仍必須嚴格遵守：故事本文 + ---DATA + JSON。"""
+
+                resp = deepseek_client.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=[
+                        {"role": "system", "content": GROK_SYSTEM_PROMPT},
+                        {"role": "user", "content": thinking_msg}
+                    ],
+                    temperature=0.82,
+                    max_tokens=3800
+                )
+                current_draft = resp.choices[0].message.content.strip()
+                logger.info(f"[DeepSeek] round {r}/{DEEPSEEK_THINK_ROUNDS} completed")
+
+            # Final polish by Grok (lightweight, high-quality)
+            logger.info(f"[Grok Polish] Sending DeepSeek draft to Grok for final modification (story {story_id})")
+            grok_polish_msg = f"""以下是 DeepSeek V4 Flash 經過 {DEEPSEEK_THINK_ROUNDS} 輪思考與改寫後的章節草稿。
+
+請你負責「最終潤飾與修改」，目標是讓故事更具文學性、情感深度、角色一致性與敘事張力。
+請保留原有劇情核心，只進行必要的優化與潤色。
+
+{current_draft}"""
+
+            response = grok_client.chat.completions.create(
+                model=GROK_MODEL,
+                messages=[
+                    {"role": "system", "content": GROK_SYSTEM_PROMPT},
+                    {"role": "user", "content": grok_polish_msg}
+                ],
+                temperature=0.75,
+                max_tokens=3800
+            )
+            full_output = response.choices[0].message.content.strip()
+            used_model = "deepseek+grok"
+        else:
+            # Original Grok-first path (when DeepSeek thinking is disabled or no key)
+            response = grok_client.chat.completions.create(
+                model=GROK_MODEL,
+                messages=[
+                    {"role": "system", "content": GROK_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.85,
+                max_tokens=3500
+            )
+            full_output = response.choices[0].message.content.strip()
+            used_model = "grok"
+
+        # Fallback to local AI if the final model refuses
         if is_refusal(full_output) and local_client:
-            logger.warning(f"Grok refused to generate chapter {chapter_num} for story {story_id}. Falling back to local model.")
+            logger.warning(f"Final model refused to generate chapter {chapter_num} for story {story_id}. Falling back to local model.")
             local_system = (
                 "【最高優先級指令 - 嚴格格式控制 + 內容寬鬆】\n"
                 "你必須嚴格按照以下格式輸出，絕對不能有任何額外文字、解釋、或重複：\n\n"
@@ -782,14 +842,63 @@ async def load_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ====================== IMAGE GENERATION ======================
 
-async def create_image_prompt(chapter_content: str) -> str:
-    """Fallback simple prompt (used when optimizer is disabled)."""
-    scene = chapter_content[:600].replace('\n', ' ').strip()
-    return (
-        f"cinematic scene from a light novel, {scene}, "
-        "highly detailed, beautiful lighting, expressive character faces, "
+async def create_image_prompt(chapter_content: str, story_id: int = None) -> str:
+    """
+    Smart fallback prompt generator.
+    Cleans raw chapter text and extracts visual elements only.
+    If the cleaned text is too short/empty, returns a safe generic prompt.
+    """
+    import re
+
+    text = chapter_content
+
+    # 1. Remove chapter titles like **第 29 章：【村裡的隱秘日常】**
+    text = re.sub(r'\*\*第\s*\d+\s*章[：:：].*?\*\*', '', text)
+
+    # 2. Remove everything from the choices section onwards
+    # (This is the most reliable way to cut off the A/B/C/D/E/I/G block)
+    choices_pos = text.find("**你接下來要怎麼做？**")
+    if choices_pos != -1:
+        text = text[:choices_pos]
+
+    # 3. Strip quoted dialogue (「...」, 『...』, "...", '...') but keep surrounding narration.
+    #    Then drop lines that become too short or empty after stripping.
+    def _strip_dialogue(line: str) -> str:
+        line = re.sub(r'「[^」]*」', '', line)
+        line = re.sub(r'『[^』]*』', '', line)
+        line = re.sub(r'"[^"]*"', '', line)
+        line = re.sub(r"'[^']*'", '', line)
+        return line.strip()
+
+    lines = text.split('\n')
+    kept = []
+    for line in lines:
+        cleaned = _strip_dialogue(line)
+        # Keep lines that still contain meaningful descriptive content
+        if len(cleaned) >= 8 and not re.match(r'^[\s，。！？、…—\-–\.\,\!\?]+$', cleaned):
+            kept.append(cleaned)
+
+    text = ' '.join(kept)
+
+    # 4. Remove remaining punctuation artifacts and normalize whitespace
+    text = re.sub(r'[「」『』【】《》「」]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    # 5. Take more text now that we preserve narration (first ~700 chars)
+    scene = text[:700].strip()
+
+    # 6. If scene is too short or empty, use a safe generic prompt
+    if len(scene) < 30:
+        base = "cinematic scene from a light novel, mysterious atmosphere, detailed environment"
+    else:
+        base = f"cinematic scene from a light novel, {scene}"
+
+    prompt = (
+        f"{base}, highly detailed, beautiful lighting, expressive character faces, "
         "atmospheric, fantasy adventure style, sharp focus, 8k"
     )
+
+    return prompt
 
 
 async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
@@ -805,17 +914,20 @@ async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
     backend = os.getenv("IMAGE_PROMPT_OPTIMIZER", "auto").lower()
 
     system_prompt = (
-        "你是一個專業的 AI 圖像 Prompt 工程師。\n"
-        "請將以下故事章節內容轉換成**單一、精簡、高品質的英文 prompt**，適合 Flux 或 Grok Imagine 使用。\n\n"
-        "要求：\n"
-        "1. 提取主要角色外觀、服裝、姿態、表情\n"
-        "2. 描述場景、光線、氛圍、構圖（camera angle, lighting, mood）\n"
-        "3. 加入適當的藝術風格詞（cinematic, highly detailed, atmospheric）\n"
-        "4. 總長度控制在 80-130 tokens 以內\n"
-        "5. 直接輸出 prompt 文字，不要加解釋或引號\n"
-        "6. 如果有角色姓名，盡量保留外觀描述一致性"
+        "你是一個嚴格的 AI 圖像 Prompt 工程師。\n"
+        "你的任務是**只從故事章節中找出最主要的一個視覺畫面**，然後輸出適合 Flux / Grok Imagine 的英文 prompt。\n\n"
+        "【絕對禁止事項】\n"
+        "- 不要包含任何對話、內心獨白、劇情解釋或故事背景。\n"
+        "- 不要總結章節內容。\n"
+        "- 不要使用中文。\n\n"
+        "【必須遵守】\n"
+        "1. 只描述「畫面能看到的東西」：角色外觀、動作、服裝、場景、光線、氛圍、構圖。\n"
+        "2. 挑選章節中最有畫面感的那一刻（例如：主角被包圍、魔法爆發、兩人對峙等）。\n"
+        "3. 輸出必須是單一段落、電影感強、細節豐富的英文 prompt（控制在 70-130 tokens）。\n"
+        "4. 開頭請用 'cinematic scene from a light novel,' 或 'highly detailed anime illustration,' 等。\n"
+        "5. 直接輸出 prompt 文字，不要任何解釋或引號。"
     )
-    user_msg = f"故事內容：\n{chapter_text[:1200]}"
+    user_msg = f"請只提取以下章節中最主要的一個視覺畫面：\n\n{chapter_text[:1400]}"
 
     def _call_optimizer(client, model_name: str, backend_name: str):
         try:
@@ -825,14 +937,21 @@ async def optimize_image_prompt(chapter_text: str, story_id: int = None) -> str:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_msg}
                 ],
-                temperature=0.4,
-                max_tokens=200
+                temperature=0.25,
+                max_tokens=160
             )
             raw = resp.choices[0].message.content.strip()
             logger.info(f"[{backend_name}] RAW optimizer output: {raw[:200]}...")
-            optimized = raw.replace("```", "").replace("prompt:", "").strip()
-            logger.info(f"[{backend_name}] Prompt optimized (len={len(optimized)}): {optimized[:120]}...")
-            return optimized
+
+            # Post-processing: remove Chinese, quotes, and truncate if too long
+            import re
+            cleaned = re.sub(r'[\u4e00-\u9fff]+', '', raw)  # remove Chinese characters
+            cleaned = cleaned.replace("```", "").replace('"', '').replace("'", "").strip()
+            if len(cleaned) > 450:
+                cleaned = cleaned[:450].rsplit('.', 1)[0] + '.'
+
+            logger.info(f"[{backend_name}] Prompt optimized (len={len(cleaned)}): {cleaned[:120]}...")
+            return cleaned if cleaned else None
         except Exception as e:
             logger.warning(f"[{backend_name}] optimization failed: {e}")
             return None
@@ -1196,12 +1315,14 @@ async def generate_image_for_chapter(chapter_content: str, story_id: int, chapte
     """
     # Prompt optimization (recommended for better image quality)
     use_optimizer = os.getenv("USE_IMAGE_PROMPT_OPTIMIZER", "true").lower() == "true"
+    prompt = None
     if use_optimizer:
         prompt = await optimize_image_prompt(chapter_content, story_id)
-        logger.info("Using optimized image prompt")
-    else:
-        prompt = await create_image_prompt(chapter_content)
-        logger.info("Using simple image prompt (optimizer disabled)")
+
+    # Fallback if optimizer failed or returned nothing
+    if not prompt:
+        prompt = await create_image_prompt(chapter_content, story_id)
+        logger.info("Using fallback simple image prompt (optimizer failed or disabled)")
 
     # Inject per-story image style into the prompt (prefer expanded prompt if available)
     try:
@@ -1710,7 +1831,8 @@ def main():
     app.add_handler(CommandHandler("bug", handle_bug_report))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice))
 
-    print("📖 sleyStory bot is running... (Hybrid Grok + Local Guardrail mode)")
+    mode = "DeepSeek V4 Flash + Grok Polish + Local Guardrail" if (deepseek_client and USE_DEEPSEEK_THINKING) else "Grok + Local Guardrail"
+    print(f"📖 sleyStory bot is running... ({mode} mode)")
     app.run_polling()
 
 if __name__ == "__main__":
