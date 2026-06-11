@@ -580,18 +580,22 @@ def generate_chapter(story_id: int, user_choice: str = None, initial_prompt: str
             # Append an extra format reminder specifically for local models
             local_user_msg = user_msg + "\n\n【格式提醒】請嚴格按照 system prompt 指定的格式輸出，絕對不要多餘文字或重複。"
 
-            local_response = local_client.chat.completions.create(
-                model=LM_STUDIO_MODEL,
-                messages=[
-                    {"role": "system", "content": local_system},
-                    {"role": "user", "content": local_user_msg}
-                ],
-                temperature=0.68,
-                max_tokens=4000
-            )
-            full_output = local_response.choices[0].message.content.strip()
-            used_model = "local"
-            logger.info(f"Local model generated chapter {chapter_num} for story {story_id} as fallback")
+            try:
+                local_response = local_client.chat.completions.create(
+                    model=LM_STUDIO_MODEL,
+                    messages=[
+                        {"role": "system", "content": local_system},
+                        {"role": "user", "content": local_user_msg}
+                    ],
+                    temperature=0.68,
+                    max_tokens=4000
+                )
+                full_output = local_response.choices[0].message.content.strip()
+                used_model = "local"
+                logger.info(f"Local model generated chapter {chapter_num} for story {story_id} as fallback")
+            except Exception as local_err:
+                logger.warning(f"Local fallback failed (no model loaded?): {local_err}. Proceeding with DeepSeek draft as-is.")
+                used_model = "deepseek"
 
         if used_model == "grok":
             logger.info(f"Grok generated chapter {chapter_num} for story {story_id}")
